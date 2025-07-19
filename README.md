@@ -13,10 +13,7 @@
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-optimize-full.sh)
 
-
 ---
-
-
 
 ## 🔍 一键检测当前网络优化状态
 
@@ -25,10 +22,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/n
 ```bash
 wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-optimize-check.sh | bash
 
-
 ---
-
-
 
 ## 🔴 一键还原并删除所有网络优化配置
 
@@ -36,6 +30,5 @@ wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-opt
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-optimize-reset.sh)
-
 
 ---
