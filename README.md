@@ -12,6 +12,7 @@
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-optimize-full.sh)
+```
 
 ---
 
