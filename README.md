@@ -28,7 +28,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/
 ---
 
 ## 🚀 一键执行网络优化配置
-** ❗（网络优化之前请先装VPS适用工具，否则网络优化可能安装不成功）**
+**❗（网络优化之前请先装VPS适用工具，否则网络优化可能安装不成功）**
 
 复制以下命令，在 VPS 上粘贴执行：
 
