@@ -23,8 +23,9 @@ bash <(wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/
 
 ## 🧬 BBRPlus 内核一键安装（慎用❗）
 
-📢适用于 RAM 足够的 KVM VPS
-🚫⚠ AMD 核心 VPS 请勿安装，否则可能直接报废！
+**📢适用于 RAM 足够的 KVM VPS**
+
+**🚫⚠ AMD 核心 VPS 请勿安装，否则可能直接报废！**
 
 ```bash
 wget -O bbrplus.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcp.sh && chmod +x bbrplus.sh && ./bbrplus.sh
