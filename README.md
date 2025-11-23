@@ -68,7 +68,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main
 
 # 🛰 VPS11 协议一键安装脚本
 
-由 mack-a 开发的 V2ray / Xray / Trojan / Reality 综合安装程序。建议选2安装Sing-box
+由 mack-a 开发的 V2ray / Xray / Trojan / Reality 综合安装程序。建议选2安装**Sing-box**
 
 ```bash
 wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh" && chmod 700 /root/install.sh && /root/install.sh
