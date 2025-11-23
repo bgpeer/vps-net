@@ -62,9 +62,9 @@ wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-opt
 ## ❌ 一键还原并删除所有网络优化配置
 
 复制以下命令，在 VPS 上粘贴执行：
-```bash
+
 bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-optimize-reset.sh)
-```
+
 ---
 
 # 🛰 VPS11 协议一键安装脚本
