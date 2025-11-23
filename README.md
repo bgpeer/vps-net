@@ -68,7 +68,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main
 
 # 🛰 VPS11 协议一键安装脚本
 
-由 mack-a 开发的 V2ray / Xray / Trojan / Reality 综合安装程序。
+由 mack-a 开发的 V2ray / Xray / Trojan / Reality 综合安装程序。建议选2安装Sing-box
 
 ```bash
 wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh" && chmod 700 /root/install.sh && /root/install.sh
@@ -76,10 +76,12 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-
 
 ---
 
-# 📱（3）ClashMeta 可直接提取的 10 协议模板（移动端可用）
+# 📱 ClashMeta 可直接提取的 10 协议模板（移动端可用）
 
 适用于 Android 手機 ClashMeta / Mihomo
 支持与 VPS11 协议配合使用：
 
 👉 一键查看模板：
 https://gist.github.com/bgpeer/279cc51c0f53e7739c832492143a3159/raw/Clashmeta.yaml
+
+可以将此模板全部复制给gpt让他记住，然后把VPS的11个协议全部复制出来给gpt让他按照这个模板来提取连接配置更换就可以了
