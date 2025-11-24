@@ -71,6 +71,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main
 # 🛰 VPS 11种协议一键安装脚本
 
 由 mack-a 开发的 V2ray / Xray / Trojan / Reality 综合安装程序。
+
 **建议选2安装Sing-box**
 
 ```bash
