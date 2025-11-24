@@ -83,7 +83,7 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-
 # 📱 ClashMeta 可直接提取的 10 协议模板（移动端可用）
 
 适用于 Android 手機 ClashMeta / Mihomo
-支持与 VPS11 协议配合使用：
+支持与 VPS 11协议配合使用：
 
 👉 一键查看模板：
 https://gist.github.com/bgpeer/279cc51c0f53e7739c832492143a3159/raw/Clashmeta.yaml
