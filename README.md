@@ -75,9 +75,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main
 ⚠️安装前请准备好**域名**托管到CF指向VPS的IP不要开小黄云才能执行代码
 
 **步骤：
+
 1️⃣ 选 1 安装  
 2️⃣ 选 2 安装 Sing-box  
 3️⃣ 输入你自己的域名......
+
 不懂就问AI**
 
 ```bash
@@ -101,7 +103,7 @@ https://gist.github.com/bgpeer/279cc51c0f53e7739c832492143a3159/raw/Clashmeta.ya
 
 # 📱 Singbox 可直接提取的 10 协议模板（移动端可用）
 
-**✅ 适配手机 sing-box 内核 1.12.12**
+**✅ 适配 sing-box 内核 1.12.12**
 
 👉 一键查看模板：
 https://gist.github.com/bgpeer/ea81e07938efe1b2e892db7a9bee872e/raw/singbox-v1.12-config.json
