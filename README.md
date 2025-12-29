@@ -98,7 +98,7 @@ https://gist.github.com/bgpeer/279cc51c0f53e7739c832492143a3159/raw/Clashmeta.ya
 
 # 📱 Singbox 可直接提取的 10 协议模板（移动端可用）
 
-**✅ 适配 sing-box 内核 1.12.12**
+**✅ 适配Android sing-box 内核 1.12.12以上**
 
 👉 一键查看模板：
 https://gist.github.com/bgpeer/ea81e07938efe1b2e892db7a9bee872e/raw/singbox-v1.12-config.json
