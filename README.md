@@ -91,7 +91,7 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-
 
 👉 一键查看模板：
 
-https://cdn.gh-proxy.org/https://gist.github.com/bgpeer/279cc51c0f53e7739c832492143a3159/raw/Clashmeta.yaml
+https://cdn.gh-proxy.org/https://gist.github.com/bgpeer/099059cfce913ef7b80496fbf4241324/raw/us_la.yaml
 
 可以将此模板全部复制给gpt让他记住，然后把VPS的11个协议全部复制出来给gpt让他按照这个模板来提取连接配置更换就可以了
 
