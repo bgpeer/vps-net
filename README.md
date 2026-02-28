@@ -211,7 +211,7 @@ https://cdn.jsdelivr.net/gh/bgpeer/vps-net-optimize@main/singbox/Loy-geosite
 ```
 https://github.com/bgpeer/vps-net-optimize/tree/main/singbox/Loy-geosite
 
-### GeoIP（SRS 目录）
+### Loy-GeoIP（SRS 目录）
 ```
 https://cdn.jsdelivr.net/gh/bgpeer/vps-net-optimize@main/singbox/Loy-geoip
 ```
