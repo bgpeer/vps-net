@@ -217,5 +217,7 @@ https://cdn.jsdelivr.net/gh/bgpeer/vps-net-optimize@main/singbox/Loy-geoip
 ```
 https://github.com/bgpeer/vps-net-optimize/tree/main/singbox/Loy-geoip
 
-> 说明：这是“目录链接”，singbox 会按需下载其中的 `.srs` 小文件（例如 `Loy-geosite/geosite-google.srs`、`Loy-geoip/geoip-google.srs`）。
+> 说明：这是“目录链接”，singbox 会按需下载其中的 `.srs` 小文件（例如
+- `Loy-geosite/geosite-google.srs`
+- `Loy-geoip/geoip-google.srs`）。
 
