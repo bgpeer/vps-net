@@ -132,17 +132,16 @@ geox-url:
 
 在 ClashMi → **Geo RuleSet** 中填写以下两个目录链接（推荐使用 CDN）：
 
-### GeoSite（域名-mrs 规则集目录）
+### Loy_GeoSite:[域名-mrs 规则集目录](https://github.com/bgpeer/vps-net-optimize/tree/main/geo/geosite)
 ```
 https://cdn.jsdelivr.net/gh/bgpeer/vps-net-optimize@main/geo/geosite
 ```
-https://github.com/bgpeer/vps-net-optimize/tree/main/geo/geosite
 
-### GeoIP（IP-mrs 规则集目录）
+### Loy_GeoIP:[IP-mrs 规则集目录](https://github.com/bgpeer/vps-net-optimize/tree/main/geo/geoip)
 ```
 https://cdn.jsdelivr.net/gh/bgpeer/vps-net-optimize@main/geo/geoip
 ```
-https://github.com/bgpeer/vps-net-optimize/tree/main/geo/geoip
+
 
 > 说明：这是“目录链接”，ClashMi 会按需下载其中的 `.mrs` 小文件（例如 
 - `geosite/google.mrs`
@@ -168,17 +167,15 @@ singbox/
 
 ## CDN 目录链接（推荐）
 
-### Loy-GeoSite（SRS 目录）
+### Loy-GeoSite:[SRS 目录](https://github.com/bgpeer/vps-net-optimize/tree/main/singbox/Loy-geosite)
 ```
 https://cdn.jsdelivr.net/gh/bgpeer/vps-net-optimize@main/singbox/Loy-geosite
 ```
-https://github.com/bgpeer/vps-net-optimize/tree/main/singbox/Loy-geosite
 
-### Loy-GeoIP（SRS 目录）
+### Loy-GeoIP:[SRS 目录](https://github.com/bgpeer/vps-net-optimize/tree/main/singbox/Loy-geoip)
 ```
 https://cdn.jsdelivr.net/gh/bgpeer/vps-net-optimize@main/singbox/Loy-geoip
 ```
-https://github.com/bgpeer/vps-net-optimize/tree/main/singbox/Loy-geoip
 
 > 说明：这是“目录链接”，singbox 会按需下载其中的 `.srs` 小文件（例如
 - `Loy-geosite/geosite-google.srs`
@@ -212,7 +209,7 @@ singbox/ geosite/   # 域名类规则集（.srs） geoip/     # IP 类规则集�
 
 ## CDN 目录链接（推荐）
 
-### GeoSite：[SRS 目录](https://github.com/bgpeer/vps-net-optimize/tree/main/singbox/geosite)
+### GeoSite:[SRS 目录](https://github.com/bgpeer/vps-net-optimize/tree/main/singbox/geosite)
 ```
 https://cdn.jsdelivr.net/gh/bgpeer/vps-net-optimize@main/singbox/geosite
 ```
