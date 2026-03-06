@@ -144,6 +144,8 @@ https://cdn.jsdelivr.net/gh/bgpeer/vps-net-optimize@main/geo/geoip
 - `geoip/google.mrs`
 
 ---
+## [可用于Clash Mi的样板](https://cdn.gh-proxy.org/https://gist.github.com/bgpeer/01f635bc410f3503a218e03e537cb135/raw/ClashMi.yaml)
+---
 
 ## 同步机制
 
