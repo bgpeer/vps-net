@@ -70,8 +70,6 @@ payload:
   - DOMAIN-SUFFIX,openaicom.imgix.net
   - DOMAIN-SUFFIX,azureedge.net
   - DOMAIN-SUFFIX,blob.core.windows.net
-  - DOMAIN-SUFFIX,cloudflareclient.com
-  - DOMAIN-SUFFIX,cloudflare.com
   # ==== 验证服务 Arkose Labs ====
   - DOMAIN-SUFFIX,client-api.arkoselabs.com
   - DOMAIN-SUFFIX,auth0.com
