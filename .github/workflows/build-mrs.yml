@@ -1,10 +1,6 @@
 name: Build MRS (mihomo) + SRS (sing-box)
 
 on:
-  # 定时触发：每天北京时间 03:00（UTC 19:00）
-  schedule:
-    - cron: "0 19 * * *"
-
   workflow_dispatch: {}
 
   # 只在本地规则/脚本/本工作流变更时触发
@@ -15,7 +11,6 @@ on:
       - "singbox/**.json"
       - "scripts/extract_rules.py"
       - "scripts/compile_srs.py"
-      - ".github/workflows/build-mrs.yml"
 
 permissions:
   contents: write
