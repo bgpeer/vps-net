@@ -143,10 +143,15 @@ detect_distro() {
 
 check_dpkg_clean() {
   if have_cmd dpkg && dpkg --audit 2>/dev/null | grep -q .; then
-    echo "⚠️ 检测到 dpkg 状态异常，请先执行修复："
-    echo "  dpkg --configure -a"
-    echo "  apt-get --fix-broken install -y"
-    exit 1
+    echo "⚠️ 检测到 dpkg 状态异常，正在自动修复..."
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y 2>&1 || true
+
+    if dpkg --audit 2>/dev/null | grep -q .; then
+      echo "❌ dpkg 自动修复失败，请手动处理后重试"
+      exit 1
+    fi
+    echo "✅ dpkg 自动修复完成"
   fi
 }
 
