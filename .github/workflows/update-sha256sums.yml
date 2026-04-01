@@ -1,0 +1,26 @@
+name: Auto-update SHA256SUMS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'net-optimize-ultimate.sh'
+
+jobs:
+  update-sha256sums:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate SHA256SUMS
+        run: sha256sum net-optimize-ultimate.sh > SHA256SUMS
+
+      - name: Commit & Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add SHA256SUMS
+          git diff --cached --quiet && echo "SHA256SUMS unchanged" && exit 0
+          git commit -m "chore: auto-update SHA256SUMS"
+          git push
