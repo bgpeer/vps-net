@@ -415,7 +415,7 @@ if [[ -r /etc/os-release ]]; then
   printf "  %-14s : %s\n" "发行版" "${PRETTY_NAME:-${ID:-unknown}}"
 fi
 printf "  %-14s : %s\n" "总内存" "$(free -h | awk '/^Mem:/ {print $2}')"
-printf "  %-14s : %s\n" "可用内存" "$(free -h | awk '/^Mem:/ {print $7}')"
+printf "  %-14s : %s\n" "可用内存" "$(free -h | awk '/^Mem:/ {print $NF}')"
 printf "  %-14s : %s\n" "运行时间" "$(uptime -p 2>/dev/null || uptime | sed 's/.*up /up /' | sed 's/,.*//')"
 
 # 脚本版本检测
