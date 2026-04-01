@@ -5,6 +5,11 @@ on:
     branches: [main]
     paths:
       - 'net-optimize-ultimate.sh'
+  workflow_dispatch: {}
+
+concurrency:
+  group: sha256sums-update
+  cancel-in-progress: true
 
 jobs:
   update-sha256sums:
