@@ -5,7 +5,7 @@ set -euo pipefail
 
 # === 自动自更新 + 自动保存副本（含 curl/wget & sha256 兜底）===
 SCRIPT_PATH="/usr/local/sbin/net-optimize-full.sh"
-REMOTE_URL="https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimize/main/net-optimize-full.sh"
+REMOTE_URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-full.sh"
 
 fetch_raw() {
   if command -v curl >/dev/null 2>&1; then
