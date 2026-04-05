@@ -15,8 +15,8 @@ set -euo pipefail
 
 # === 1. 自动更新机制（含 SHA256SUMS 校验）===
 SCRIPT_PATH="/usr/local/sbin/net-optimize-ultimate.sh"
-REMOTE_URL="https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimize/main/net-optimize-ultimate.sh"
-REMOTE_SHA256SUMS_URL="https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimize/main/SHA256SUMS"
+REMOTE_URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh"
+REMOTE_SHA256SUMS_URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/SHA256SUMS"
 
 # conntrack 模块开机加载（systemd）
 CONNTRACK_MODULES_CONF="/etc/modules-load.d/conntrack.conf"
