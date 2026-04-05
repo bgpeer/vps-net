@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-URL="https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimize/main/net-optimize-ultimate.sh"
+URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh"
 DST="/usr/local/sbin/net-optimize-ultimate.sh"
 
 tmp="$(mktemp)"
