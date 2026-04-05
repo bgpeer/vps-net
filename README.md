@@ -15,7 +15,7 @@
 在 VPS 上执行以下命令即可一键运行（自动下载并执行最新脚本）：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimize/main/setup-tools.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net/main/setup-tools.sh)
 ```
 
 ---
@@ -44,7 +44,7 @@ wget -O bbrplus.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/mast
 复制以下命令，在 VPS 上粘贴执行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimize/main/net-optimize-ultimate.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
 ```
 
 ---
@@ -54,7 +54,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimiz
 复制以下命令，在 VPS 上粘贴执行：
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimize/main/net-optimize-check.sh | bash
+wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-check.sh | bash
 ```
 ---
 
@@ -62,7 +62,7 @@ wget -qO- https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimize/main/n
 
 复制以下命令，在 VPS 上粘贴执行：
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/SHICHUNHUI88/vps-net-optimize/main/net-optimize-reset.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-reset.sh)
 ```
 
 ---
@@ -88,7 +88,7 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-
 适用于 Android 手機 ClashMeta /Clash Mi（ Mihomo
 ）支持与 VPS 11协议配合使用：
 
-[👉 一键查看模板](https://cdn.gh-proxy.org/https://gist.githubusercontent.com/SHICHUNHUI88/099059cfce913ef7b80496fbf4241324/raw/us_la.yaml)
+[👉 一键查看模板](https://cdn.gh-proxy.org/https://gist.githubusercontent.com/bgpeer/099059cfce913ef7b80496fbf4241324/raw/us_la.yaml)
 
 可以将此模板全部复制给gpt让他记住，然后把VPS的11个协议全部复制出来给gpt让他按照这个模板来提取连接配置更换就可以了
 
@@ -98,5 +98,4 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-
 
 **✅ 适配Android sing-box 内核 1.12.12以上**
 
-[👉 一键查看模板](https://cdn.gh-proxy.org/https://gist.githubusercontent.com/SHICHUNHUI88/ea81e07938efe1b2e892db7a9bee872e/raw/singbox-v1.12-config.json)
-
+[👉 一键查看模板](https://cdn.gh-proxy.org/https://gist.githubusercontent.com/bgpeer/ea81e07938efe1b2e892db7a9bee872e/raw/singbox-v1.12-config.json)
