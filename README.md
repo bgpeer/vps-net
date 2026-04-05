@@ -15,7 +15,7 @@
 在 VPS 上执行以下命令即可一键运行（自动下载并执行最新脚本）：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/setup-tools.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net/main/setup-tools.sh)
 ```
 
 ---
@@ -44,7 +44,7 @@ wget -O bbrplus.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/mast
 复制以下命令，在 VPS 上粘贴执行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-optimize-ultimate.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
 ```
 
 ---
@@ -54,7 +54,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main
 复制以下命令，在 VPS 上粘贴执行：
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-optimize-check.sh | bash
+wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-check.sh | bash
 ```
 ---
 
@@ -62,7 +62,7 @@ wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-opt
 
 复制以下命令，在 VPS 上粘贴执行：
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net-optimize/main/net-optimize-reset.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-reset.sh)
 ```
 
 ---
@@ -99,4 +99,3 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-
 **✅ 适配Android sing-box 内核 1.12.12以上**
 
 [👉 一键查看模板](https://cdn.gh-proxy.org/https://gist.githubusercontent.com/bgpeer/ea81e07938efe1b2e892db7a9bee872e/raw/singbox-v1.12-config.json)
-
