@@ -347,6 +347,11 @@ clean_old_config() {
       need_clean=1
     fi
   fi
+  if have_cmd iptables-legacy; then
+    if timeout 2s iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -q TCPMSS; then
+      need_clean=1
+    fi
+  fi
 
   if [[ "$need_clean" -eq 0 ]]; then
     echo "✅ 未发现旧配置，跳过清理"
@@ -360,14 +365,16 @@ clean_old_config() {
   timeout 5s systemctl disable net-optimize.service 2>/dev/null || true
   rm -f /etc/systemd/system/net-optimize.service
 
-  if have_cmd iptables; then
-    timeout 3s iptables -w 2 -t mangle -S POSTROUTING 2>/dev/null \
+  # 清理所有后端的 TCPMSS 规则
+  for _clean_cmd in iptables iptables-legacy iptables-nft; do
+    have_cmd "$_clean_cmd" || continue
+    timeout 3s "$_clean_cmd" -w 2 -t mangle -S POSTROUTING 2>/dev/null \
       | grep -E '(^-A POSTROUTING .*TCPMSS| TCPMSS )' \
       | while read -r rule; do
           del_rule="${rule/-A POSTROUTING/-D POSTROUTING}"
-          iptables -w 2 -t mangle $del_rule 2>/dev/null || true
+          "$_clean_cmd" -w 2 -t mangle $del_rule 2>/dev/null || true
         done || true
-  fi
+  done
 
   mkdir -p "$CONFIG_DIR"
   rm -f "$CONFIG_FILE" "$MODULES_FILE"
@@ -766,6 +773,36 @@ _nopt_apply_one_tcpmss() {
   return 1
 }
 
+# --- 检测 iptables 实际可用后端 ---
+# 有些系统同时装了 iptables-nft 和 iptables-legacy，默认 iptables 指向 nft，
+# 但 legacy tables 存在时 nft 后端写入会静默失败或被忽略。
+# 检测方法：如果 iptables 输出包含 "iptables-legacy tables present" 警告，
+# 说明应该用 iptables-legacy 作为实际后端。
+_nopt_detect_ipt_backend() {
+  local warn
+  if have_cmd iptables; then
+    warn="$(iptables -t mangle -S POSTROUTING 2>&1 || true)"
+    if echo "$warn" | grep -qi 'iptables-legacy'; then
+      if have_cmd iptables-legacy; then
+        echo "iptables-legacy"
+        return 0
+      fi
+    fi
+    echo "iptables"
+    return 0
+  fi
+  # fallback
+  if have_cmd iptables-legacy; then
+    echo "iptables-legacy"
+    return 0
+  fi
+  if have_cmd iptables-nft; then
+    echo "iptables-nft"
+    return 0
+  fi
+  echo ""
+}
+
 setup_mss_clamping() {
   if [ "${ENABLE_MSS_CLAMP:-0}" != "1" ]; then
     echo "⏭️ 跳过MSS Clamping"
@@ -784,59 +821,51 @@ setup_mss_clamping() {
     echo "✅ 检测到出口接口: $iface"
   fi
 
+  # 检测实际后端
+  local ipt_backend
+  ipt_backend="$(_nopt_detect_ipt_backend)"
+  [ -z "$ipt_backend" ] && { echo "⚠️ iptables 不可用，跳过"; return 0; }
+  echo "  ℹ️ iptables 后端: $ipt_backend"
+
   mkdir -p "$(dirname "$CONFIG_FILE")"
   cat > "$CONFIG_FILE" <<EOF
 ENABLE_MSS_CLAMP=1
 CLAMP_IFACE=$iface
 MSS_VALUE=$MSS_VALUE
 RP_FILTER=$RP_FILTER
+IPT_BACKEND=$ipt_backend
 EOF
 
-  # 收集可用后端
-  local ipt_cmds=()
-  for c in iptables iptables-nft iptables-legacy; do
-    have_cmd "$c" && ipt_cmds+=("$c")
-  done
-  [ "${#ipt_cmds[@]}" -eq 0 ] && { echo "⚠️ iptables 不可用，跳过"; return 0; }
-
   # 1) 所有后端先强制清理
-  for cmd in "${ipt_cmds[@]}"; do
-    _nopt_clear_all_tcpmss "$cmd"
+  for cmd in iptables iptables-nft iptables-legacy; do
+    have_cmd "$cmd" && _nopt_clear_all_tcpmss "$cmd"
   done
 
-  # 2) 只用默认 iptables 写 1 条（和 apply 脚本统一）
-  if _nopt_apply_one_tcpmss "iptables" "$iface" "$MSS_VALUE"; then
-    echo "✅ MSS 规则已写入（iptables）"
+  # 2) 用检测到的后端写入 1 条
+  if _nopt_apply_one_tcpmss "$ipt_backend" "$iface" "$MSS_VALUE"; then
+    echo "✅ MSS 规则已写入（$ipt_backend）"
   else
-    echo "⚠️ 写入失败（iptables），尝试其他后端..."
-    local ok=0
-    for cmd in "${ipt_cmds[@]}"; do
-      [ "$cmd" = "iptables" ] && continue
-      if _nopt_apply_one_tcpmss "$cmd" "$iface" "$MSS_VALUE"; then
-        ok=1; echo "✅ MSS 规则已写入（$cmd）"; break
-      fi
-    done
-    [ "$ok" -eq 1 ] || { echo "❌ MSS 写入失败"; return 1; }
+    echo "❌ MSS 写入失败（$ipt_backend）"
+    return 1
   fi
 
-  # 3) 验证 + 自动去重（保留最后 1 条，删除多余）
+  # 3) 验证 + 自动去重（用同一个后端检查）
   local cnt dedup_round=0
   while :; do
-    cnt="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+    cnt="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
     cnt="${cnt%%$'\n'*}"; cnt="${cnt:-0}"
     [ "$cnt" -le 1 ] && break
 
     dedup_round=$((dedup_round + 1))
     [ "$dedup_round" -gt 20 ] && { echo "⚠️ TCPMSS 去重超限，跳过"; break; }
 
-    # 删除第一条匹配的 TCPMSS 规则（保留最后写入的那条）
     local first_rule
-    first_rule="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
+    first_rule="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
     [ -z "$first_rule" ] && break
     local del_rule="${first_rule/-A POSTROUTING/-D POSTROUTING}"
     local -a del_parts
     read -r -a del_parts <<<"$del_rule"
-    iptables -t mangle "${del_parts[@]}" 2>/dev/null || break
+    "$ipt_backend" -t mangle "${del_parts[@]}" 2>/dev/null || break
   done
 
   if [ "$cnt" -eq 1 ]; then
@@ -1029,7 +1058,7 @@ if command -v curl >/dev/null 2>&1; then
   curl -4I https://www.google.com --max-time 3 >/dev/null 2>&1 || true
 fi
 
-# === MSS Clamping（与主脚本统一：只用默认 iptables 写 1 条）===
+# === MSS Clamping（使用检测到的后端，与主脚本统一）===
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
 
@@ -1037,7 +1066,20 @@ if [ -f "$CONFIG_FILE" ]; then
     MSS="${MSS_VALUE:-1452}"
     IFACE="${CLAMP_IFACE:-}"
 
-    if command -v iptables >/dev/null 2>&1; then
+    # 后端检测：优先用 config 记录的，否则自动检测
+    IPT="${IPT_BACKEND:-iptables}"
+    if ! command -v "$IPT" >/dev/null 2>&1; then
+      IPT="iptables"
+    fi
+    # 二次校验：如果默认 iptables 有 legacy 警告，切换到 legacy
+    if [ "$IPT" = "iptables" ] && command -v iptables >/dev/null 2>&1; then
+      _warn="$(iptables -t mangle -S POSTROUTING 2>&1 || true)"
+      if echo "$_warn" | grep -qi 'iptables-legacy' && command -v iptables-legacy >/dev/null 2>&1; then
+        IPT="iptables-legacy"
+      fi
+    fi
+
+    if command -v "$IPT" >/dev/null 2>&1; then
       modprobe ip_tables 2>/dev/null || true
       modprobe iptable_mangle 2>/dev/null || true
 
@@ -1056,29 +1098,29 @@ if [ -f "$CONFIG_FILE" ]; then
         done
       done
 
-      # 只用默认 iptables 写 1 条（与主脚本一致）
+      # 用检测到的后端写入 1 条
       if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
-        iptables -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+        "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
           -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
       else
-        iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+        "$IPT" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
           -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
       fi
 
-      # 自动去重（保留最后 1 条，删除多余）
+      # 自动去重（用同一个后端检查，保留 1 条）
       _dedup_cnt=0
       _dedup_r=0
       while :; do
-        _dedup_cnt="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+        _dedup_cnt="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
         _dedup_cnt="${_dedup_cnt%%$'\n'*}"; _dedup_cnt="${_dedup_cnt:-0}"
         [ "$_dedup_cnt" -le 1 ] && break
         _dedup_r=$((_dedup_r + 1))
         [ "$_dedup_r" -gt 20 ] && break
-        _first="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
+        _first="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
         [ -z "$_first" ] && break
         _del="${_first/-A POSTROUTING/-D POSTROUTING}"
         read -r -a _parts <<<"$_del"
-        iptables -t mangle "${_parts[@]}" 2>/dev/null || break
+        "$IPT" -t mangle "${_parts[@]}" 2>/dev/null || break
       done
     fi
   fi
@@ -1179,11 +1221,19 @@ print_status() {
   fi
   echo ""
 
-  printf "📡 MSS Clamping 规则（默认后端 iptables）:\n"
-  if have_cmd iptables && iptables -t mangle -L POSTROUTING -n 2>/dev/null | grep -q TCPMSS; then
-    iptables -t mangle -L POSTROUTING -n -v 2>/dev/null | grep -E 'Chain|pkts|bytes|TCPMSS' || true
-  else
-    printf "  ⚠️ 未找到 MSS 规则（可用 iptables-nft/iptables-legacy 再看）\n"
+  printf "📡 MSS Clamping 规则:\n"
+  local _ps_found=0
+  for _ps_cmd in iptables iptables-legacy iptables-nft; do
+    have_cmd "$_ps_cmd" || continue
+    if "$_ps_cmd" -t mangle -L POSTROUTING -n 2>/dev/null | grep -q TCPMSS; then
+      printf "  ✅ 后端: %s\n" "$_ps_cmd"
+      "$_ps_cmd" -t mangle -L POSTROUTING -n -v 2>/dev/null | grep -E 'Chain|pkts|bytes|TCPMSS' || true
+      _ps_found=1
+      break
+    fi
+  done
+  if [ "$_ps_found" -eq 0 ]; then
+    printf "  ⚠️ 未找到 MSS 规则（所有后端均未检测到）\n"
   fi
   echo ""
 
