@@ -227,7 +227,13 @@ for _dcmd in iptables iptables-legacy iptables-nft; do
   has "$_dcmd" || continue
   _dc="$("$_dcmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP' || true)"
   _dc="${_dc%%$'\n'*}"; _dc="${_dc:-0}"
-  [[ "$_dc" -gt 0 ]] && { green "✅ DSCP 标记：$_dc 条 [$_dcmd]（QUIC 加速）"; _dscp_found=1; break; }
+  [[ "$_dc" -gt 0 ]] && { green "✅ IPv4 DSCP 标记：$_dc 条 [$_dcmd]（QUIC 加速）"; _dscp_found=1; break; }
+done
+for _dcmd6 in ip6tables ip6tables-legacy ip6tables-nft; do
+  has "$_dcmd6" || continue
+  _dc6="$("$_dcmd6" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP' || true)"
+  _dc6="${_dc6%%$'\n'*}"; _dc6="${_dc6:-0}"
+  [[ "$_dc6" -gt 0 ]] && { green "✅ IPv6 DSCP 标记：$_dc6 条 [$_dcmd6]（QUIC 加速）"; _dscp_found=1; break; }
 done
 [[ "$_dscp_found" -eq 0 ]] && echo "  ℹ️ DSCP 标记：未发现"
 
@@ -275,7 +281,13 @@ if [[ -f "$SYSCTL_FILE" ]]; then
     fv="${fv:-N/A}"
     rt_n="$(echo "$rt" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"; fv_n="$(echo "$fv" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
     if [[ "$fv_n" == "N/A" ]]; then echo "  ℹ️ $k: runtime=$rt"
-    elif [[ "$rt_n" != "$fv_n" ]]; then yellow "  ⚠️ $k: runtime=$rt file=$fv"
+    elif [[ "$rt_n" != "$fv_n" ]]; then
+      # qdisc/cc 可能由外部内核脚本管控，不一致时降级为提示
+      if [[ "$k" == "net.core.default_qdisc" || "$k" == "net.ipv4.tcp_congestion_control" ]]; then
+        echo "  ℹ️ $k: runtime=$rt_n（外部设置）, file=$fv_n"
+      else
+        yellow "  ⚠️ $k: runtime=$rt file=$fv"
+      fi
     else green "  ✅ $k: $rt"; fi
   done
 fi
@@ -304,7 +316,21 @@ fi
 sep
 echo "💻 [11] 系统信息"
 sep
-printf "  %-12s: %s\n" "内核" "$(uname -r)" "CPU" "$(nproc 2>/dev/null || echo '?') 核" "内存" "$(free -h | awk '/^Mem:/{print $2}')" "可用" "$(free -h | awk '/^Mem:/{print $NF}')" "运行" "$(uptime -p 2>/dev/null || echo '?')"
+printf "  %-10s: %s\n" "内核" "$(uname -r)"
+printf "  %-10s: %s\n" "CPU" "$(nproc 2>/dev/null || echo '?') 核"
+if has free; then
+  printf "  %-10s: %s\n" "内存" "$(free -h 2>/dev/null | awk '/^Mem:/{print $2}')"
+  printf "  %-10s: %s\n" "可用" "$(free -h 2>/dev/null | awk '/^Mem:/{print $7}')"
+elif [[ -f /proc/meminfo ]]; then
+  _mem_total="$(awk '/^MemTotal:/{printf "%.0f MB", $2/1024}' /proc/meminfo 2>/dev/null || echo '?')"
+  _mem_avail="$(awk '/^MemAvailable:/{printf "%.0f MB", $2/1024}' /proc/meminfo 2>/dev/null || echo '?')"
+  printf "  %-10s: %s\n" "内存" "$_mem_total"
+  printf "  %-10s: %s\n" "可用" "$_mem_avail"
+else
+  printf "  %-10s: %s\n" "内存" "N/A"
+  printf "  %-10s: %s\n" "可用" "N/A"
+fi
+printf "  %-10s: %s\n" "运行" "$(uptime -p 2>/dev/null || echo '?')"
 [[ -f /usr/local/sbin/net-optimize-ultimate.sh ]] && green "✅ 脚本版本：$(grep -oP 'v\d+\.\d+\.\d+' /usr/local/sbin/net-optimize-ultimate.sh | head -n1)"
 [[ -n "$IPT_CMD" ]] && echo "  ℹ️ iptables 后端：$IPT_CMD"
 [[ -n "$OUT_IFACE" ]] && echo "  ℹ️ 出口网卡：$OUT_IFACE"
