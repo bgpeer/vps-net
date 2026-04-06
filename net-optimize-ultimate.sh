@@ -142,31 +142,42 @@ detect_distro() {
 }
 
 check_dpkg_clean() {
-  if have_cmd dpkg && dpkg --audit 2>/dev/null | grep -q .; then
-    echo "⚠️ 检测到 dpkg 状态异常，正在自动修复..."
+  have_cmd dpkg || return 0
 
-    # 第一轮：常规修复
-    DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y 2>&1 || true
+  # 检查是否有异常状态的包
+  local broken_pkgs
+  broken_pkgs="$(dpkg --audit 2>/dev/null || true)"
+  [ -z "$broken_pkgs" ] && return 0
 
-    # 第二轮：如果还有问题，强制移除卡住的包
-    if dpkg --audit 2>/dev/null | grep -q .; then
-      echo "⚠️ 常规修复失败，尝试强制移除异常包..."
-      local broken_pkgs
-      broken_pkgs="$(dpkg --audit 2>/dev/null | awk '/^Package:/{print $2}' || true)"
-      for pkg in $broken_pkgs; do
-        echo "  🔧 强制移除: $pkg"
-        dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
-      done
-      DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y 2>&1 || true
-    fi
+  echo "⚠️ 检测到 dpkg 状态异常，正在自动修复..."
 
-    if dpkg --audit 2>/dev/null | grep -q .; then
-      echo "❌ dpkg 自动修复失败，请手动处理后重试"
-      exit 1
-    fi
-    echo "✅ dpkg 自动修复完成"
+  # 第一轮：常规修复（尝试正常 configure）
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y 2>&1 || true
+
+  # 检查是否修好了
+  broken_pkgs="$(dpkg --audit 2>/dev/null || true)"
+  [ -z "$broken_pkgs" ] && { echo "✅ dpkg 自动修复完成"; return 0; }
+
+  # 第二轮：提取卡住的包名，逐个强制移除
+  echo "⚠️ 常规修复失败，强制移除无法修复的包..."
+  local pkg
+  dpkg -l 2>/dev/null | awk '/^[hiuFH]/{print $2}' | while read -r pkg; do
+    [ -z "$pkg" ] && continue
+    echo "  🔧 强制移除: $pkg"
+    dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
+  done
+
+  # 清理残留依赖
+  DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>&1 || true
+
+  # 最终检查
+  if dpkg --audit 2>/dev/null | grep -q .; then
+    echo "❌ dpkg 自动修复失败，请手动处理后重试"
+    exit 1
   fi
+  echo "✅ dpkg 异常包已清理，环境恢复正常"
 }
 
 # === conntrack 可用性检测（不依赖 lsmod）===
