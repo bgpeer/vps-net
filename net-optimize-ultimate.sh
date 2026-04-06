@@ -144,6 +144,17 @@ detect_distro() {
 check_dpkg_clean() {
   if have_cmd dpkg && dpkg --audit 2>/dev/null | grep -q .; then
     echo "⚠️ 检测到 dpkg 状态异常，正在自动修复..."
+
+    # 先尝试强制移除卡住的包（如 GCP 预装的 pcp）
+    local broken_pkgs
+    broken_pkgs="$(dpkg --audit 2>/dev/null | awk '/^Package:/{print $2}' || true)"
+    if [ -n "$broken_pkgs" ]; then
+      for pkg in $broken_pkgs; do
+        echo "  🔧 强制移除异常包: $pkg"
+        dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
+      done
+    fi
+
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 || true
     DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y 2>&1 || true
 
