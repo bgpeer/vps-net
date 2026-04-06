@@ -362,12 +362,22 @@ clean_old_config() {
   [[ -d "$CONFIG_DIR" ]] && need_clean=1
 
   if have_cmd iptables; then
-    if timeout 2s iptables -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -q TCPMSS; then
+    if timeout 2s iptables -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -qE 'TCPMSS|DSCP'; then
       need_clean=1
     fi
   fi
   if have_cmd iptables-legacy; then
-    if timeout 2s iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -q TCPMSS; then
+    if timeout 2s iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -qE 'TCPMSS|DSCP'; then
+      need_clean=1
+    fi
+  fi
+  if have_cmd ip6tables-legacy; then
+    if timeout 2s ip6tables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -qE 'TCPMSS|DSCP'; then
+      need_clean=1
+    fi
+  fi
+  if have_cmd ip6tables; then
+    if timeout 2s ip6tables -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -qE 'TCPMSS|DSCP'; then
       need_clean=1
     fi
   fi
@@ -384,15 +394,19 @@ clean_old_config() {
   timeout 5s systemctl disable net-optimize.service 2>/dev/null || true
   rm -f /etc/systemd/system/net-optimize.service
 
-  # 清理所有后端的 TCPMSS 规则
-  for _clean_cmd in iptables iptables-legacy iptables-nft; do
+  # 清理所有后端的 TCPMSS + DSCP 规则（IPv4 + IPv6）
+  for _clean_cmd in iptables iptables-legacy iptables-nft ip6tables ip6tables-legacy ip6tables-nft; do
     have_cmd "$_clean_cmd" || continue
-    timeout 3s "$_clean_cmd" -w 2 -t mangle -S POSTROUTING 2>/dev/null \
-      | grep -E '(^-A POSTROUTING .*TCPMSS| TCPMSS )' \
-      | while read -r rule; do
-          del_rule="${rule/-A POSTROUTING/-D POSTROUTING}"
-          "$_clean_cmd" -w 2 -t mangle $del_rule 2>/dev/null || true
-        done || true
+    local _clean_rules
+    _clean_rules="$(timeout 3s "$_clean_cmd" -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -E 'TCPMSS|DSCP' || true)"
+    [ -z "$_clean_rules" ] && continue
+    while IFS= read -r rule; do
+      [ -z "$rule" ] && continue
+      local del_rule="${rule/-A POSTROUTING/-D POSTROUTING}"
+      local -a del_parts
+      read -r -a del_parts <<<"$del_rule"
+      "$_clean_cmd" -w 2 -t mangle "${del_parts[@]}" 2>/dev/null || true
+    done <<<"$_clean_rules"
   done
 
   mkdir -p "$CONFIG_DIR"
@@ -939,6 +953,23 @@ setup_dscp_marking() {
     "$ipt_backend" -t mangle -A POSTROUTING $rule_opts 2>/dev/null || true
   fi
 
+  # IPv4 DSCP 去重（保留 1 条）
+  local _dscp_cnt _dscp_dd=0
+  while :; do
+    _dscp_cnt="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP' || true)"
+    _dscp_cnt="${_dscp_cnt%%$'\n'*}"; _dscp_cnt="${_dscp_cnt:-0}"
+    [ "$_dscp_cnt" -le 1 ] && break
+    _dscp_dd=$((_dscp_dd + 1))
+    [ "$_dscp_dd" -gt 20 ] && break
+    local _dscp_first
+    _dscp_first="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP' | head -n1 || true)"
+    [ -z "$_dscp_first" ] && break
+    local _dscp_del="${_dscp_first/-A POSTROUTING/-D POSTROUTING}"
+    local -a _dscp_parts
+    read -r -a _dscp_parts <<<"$_dscp_del"
+    "$ipt_backend" -t mangle "${_dscp_parts[@]}" 2>/dev/null || break
+  done
+
   # IPv6 DSCP（如果有 ip6tables 对应后端）
   local ip6_cmd=""
   if [ "$ipt_backend" = "iptables-legacy" ] && have_cmd ip6tables-legacy; then
@@ -966,6 +997,23 @@ setup_dscp_marking() {
     else
       "$ip6_cmd" -t mangle -A POSTROUTING $rule_opts 2>/dev/null || true
     fi
+
+    # IPv6 DSCP 去重
+    local _dscp6_cnt _dscp6_dd=0
+    while :; do
+      _dscp6_cnt="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP' || true)"
+      _dscp6_cnt="${_dscp6_cnt%%$'\n'*}"; _dscp6_cnt="${_dscp6_cnt:-0}"
+      [ "$_dscp6_cnt" -le 1 ] && break
+      _dscp6_dd=$((_dscp6_dd + 1))
+      [ "$_dscp6_dd" -gt 20 ] && break
+      local _d6f
+      _d6f="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP' | head -n1 || true)"
+      [ -z "$_d6f" ] && break
+      local _d6del="${_d6f/-A POSTROUTING/-D POSTROUTING}"
+      local -a _d6p
+      read -r -a _d6p <<<"$_d6del"
+      "$ip6_cmd" -t mangle "${_d6p[@]}" 2>/dev/null || break
+    done
   fi
 
   echo "  ✅ UDP 443 (QUIC) DSCP=EF 已标记（$ipt_backend）"
@@ -1231,17 +1279,17 @@ setup_mss_clamping() {
     echo "✅ 检测到出口接口: $iface"
   fi
 
+  # 确保 iptables 模块已加载（有些系统首次调用前需要，必须在后端检测前执行）
+  modprobe ip_tables 2>/dev/null || true
+  modprobe iptable_mangle 2>/dev/null || true
+  modprobe ip6_tables 2>/dev/null || true
+  modprobe ip6table_mangle 2>/dev/null || true
+
   # 检测实际后端
   local ipt_backend
   ipt_backend="$(_nopt_detect_ipt_backend)"
   [ -z "$ipt_backend" ] && { echo "⚠️ iptables 不可用，跳过"; return 0; }
   echo "  ℹ️ iptables 后端: $ipt_backend"
-
-  # 确保 iptables 模块已加载（有些系统首次调用前需要）
-  modprobe ip_tables 2>/dev/null || true
-  modprobe iptable_mangle 2>/dev/null || true
-  modprobe ip6_tables 2>/dev/null || true
-  modprobe ip6table_mangle 2>/dev/null || true
 
   mkdir -p "$(dirname "$CONFIG_FILE")"
   cat > "$CONFIG_FILE" <<EOF
