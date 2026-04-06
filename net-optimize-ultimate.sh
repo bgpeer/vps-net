@@ -819,14 +819,32 @@ EOF
     [ "$ok" -eq 1 ] || { echo "❌ MSS 写入失败"; return 1; }
   fi
 
-  # 3) 验证
-  local cnt
-  cnt="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-  cnt="${cnt%%$'\n'*}"; cnt="${cnt:-0}"
-  if [ "$cnt" -gt 1 ]; then
-    echo "⚠️ 仍检测到重复 TCPMSS：$cnt 条（可能有其他脚本/服务在加）"
+  # 3) 验证 + 自动去重（保留最后 1 条，删除多余）
+  local cnt dedup_round=0
+  while :; do
+    cnt="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+    cnt="${cnt%%$'\n'*}"; cnt="${cnt:-0}"
+    [ "$cnt" -le 1 ] && break
+
+    dedup_round=$((dedup_round + 1))
+    [ "$dedup_round" -gt 20 ] && { echo "⚠️ TCPMSS 去重超限，跳过"; break; }
+
+    # 删除第一条匹配的 TCPMSS 规则（保留最后写入的那条）
+    local first_rule
+    first_rule="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
+    [ -z "$first_rule" ] && break
+    local del_rule="${first_rule/-A POSTROUTING/-D POSTROUTING}"
+    local -a del_parts
+    read -r -a del_parts <<<"$del_rule"
+    iptables -t mangle "${del_parts[@]}" 2>/dev/null || break
+  done
+
+  if [ "$cnt" -eq 1 ]; then
+    echo "✅ TCPMSS 规则数量：1（正常）"
+  elif [ "$cnt" -eq 0 ]; then
+    echo "⚠️ TCPMSS 规则数量：0（写入可能失败）"
   else
-    echo "✅ TCPMSS 规则数量：$cnt"
+    echo "⚠️ TCPMSS 规则数量：$cnt（仍有重复，可能有其他服务在加）"
   fi
 
   echo "✅ MSS Clamping 设置完成"
@@ -1046,6 +1064,22 @@ if [ -f "$CONFIG_FILE" ]; then
         iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
           -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
       fi
+
+      # 自动去重（保留最后 1 条，删除多余）
+      local _dedup_cnt _dedup_r=0
+      while :; do
+        _dedup_cnt="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+        _dedup_cnt="${_dedup_cnt%%$'\n'*}"; _dedup_cnt="${_dedup_cnt:-0}"
+        [ "$_dedup_cnt" -le 1 ] && break
+        _dedup_r=$((_dedup_r + 1))
+        [ "$_dedup_r" -gt 20 ] && break
+        local _first
+        _first="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
+        [ -z "$_first" ] && break
+        local _del="${_first/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a _parts <<<"$_del"
+        iptables -t mangle "${_parts[@]}" 2>/dev/null || break
+      done
     fi
   fi
 fi
