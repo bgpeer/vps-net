@@ -110,6 +110,7 @@ echo "========================================================"
 : "${ENABLE_DSCP:=1}"           # QUIC/UDP DSCP 优先级标记
 : "${ENABLE_INITCWND:=1}"       # 自动检测线路质量调整 initcwnd
 : "${TCP_NOTSENT_LOWAT:=4096}"  # 代理场景低延迟（默认 4096，原 16384）
+: "${AGGRESSIVE_MODE:=0}"      # 激进模式：抢带宽（类似 Hy2 暴力发包思路）
 
 # 路径定义
 CONFIG_DIR="/etc/net-optimize"
@@ -482,14 +483,26 @@ EOF
 setup_tcp_congestion() {
   echo "📶 设置TCP拥塞算法和队列..."
 
-  if [ "$ENABLE_FQ_PIE" = "1" ] && try_set_qdisc fq_pie; then
-    FINAL_QDISC="fq_pie"
-  elif try_set_qdisc fq; then
-    FINAL_QDISC="fq"
-  elif try_set_qdisc pie; then
-    FINAL_QDISC="pie"
+  if [ "$AGGRESSIVE_MODE" = "1" ]; then
+    # 激进模式：用 pfifo_fast 不限速，不做公平调度
+    if try_set_qdisc pfifo_fast; then
+      FINAL_QDISC="pfifo_fast"
+    elif try_set_qdisc fq; then
+      FINAL_QDISC="fq"
+    else
+      FINAL_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    fi
+    echo "  ⚡ 激进模式：队列算法 pfifo_fast（无限速）"
   else
-    FINAL_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    if [ "$ENABLE_FQ_PIE" = "1" ] && try_set_qdisc fq_pie; then
+      FINAL_QDISC="fq_pie"
+    elif try_set_qdisc fq; then
+      FINAL_QDISC="fq"
+    elif try_set_qdisc pie; then
+      FINAL_QDISC="pie"
+    else
+      FINAL_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    fi
   fi
 
   local target_cc="cubic"
@@ -593,6 +606,29 @@ write_sysctl_conf() {
     echo "net.ipv4.udp_wmem_min = 16384"
     echo "net.ipv4.udp_mem = 65536 131072 262144"
     echo
+
+    if [ "$AGGRESSIVE_MODE" = "1" ]; then
+      echo "# === 激进模式参数（抢带宽）==="
+      echo "# 加大发送队列深度，减少队列满丢包"
+      echo "net.core.netdev_max_backlog = 1000000"
+      echo "# 关闭 TCP 指数退避，丢包后不减速"
+      echo "net.ipv4.tcp_retries2 = 15"
+      echo "# 关闭慢启动重启"
+      echo "net.ipv4.tcp_slow_start_after_idle = 0"
+      echo "# 关闭 metrics 缓存，每次连接都从最大窗口开始"
+      echo "net.ipv4.tcp_no_metrics_save = 1"
+      echo "# 最大化 TCP 初始窗口相关"
+      echo "net.ipv4.tcp_notsent_lowat = 131072"
+      echo "# 加大 SYN backlog"
+      echo "net.ipv4.tcp_max_syn_backlog = 2097152"
+      echo "# UDP 缓冲区加大到 128MB"
+      echo "net.ipv4.udp_rmem_min = 65536"
+      echo "net.ipv4.udp_wmem_min = 65536"
+      echo "net.ipv4.udp_mem = 131072 262144 524288"
+      echo "# 加大 orphan 重试，不轻易放弃连接"
+      echo "net.ipv4.tcp_orphan_retries = 3"
+      echo
+    fi
 
     echo "# === 路由/转发 ==="
     echo "net.ipv4.ip_forward = 1"
@@ -752,14 +788,32 @@ setup_nic_offload() {
   # 开启 tx-nocache-copy 减少代理场景 CPU 拷贝
   ethtool -K "$iface" tx-nocache-copy on 2>/dev/null || true
 
+  # 激进模式：加大网卡环形缓冲区
+  if [ "${AGGRESSIVE_MODE:-0}" = "1" ]; then
+    # 加大 txqueuelen（发送队列深度）
+    ip link set "$iface" txqueuelen 10000 2>/dev/null || true
+    echo "  ⚡ 激进模式: txqueuelen=10000"
+
+    # 尝试加大网卡 ring buffer
+    local rx_max tx_max
+    rx_max="$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set.*/{found=1} found && /RX:/{print $2; exit}' || true)"
+    tx_max="$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set.*/{found=1} found && /TX:/{print $2; exit}' || true)"
+    [ -n "$rx_max" ] && [ "$rx_max" -gt 0 ] 2>/dev/null && ethtool -G "$iface" rx "$rx_max" 2>/dev/null || true
+    [ -n "$tx_max" ] && [ "$tx_max" -gt 0 ] 2>/dev/null && ethtool -G "$iface" tx "$tx_max" 2>/dev/null || true
+    echo "  ⚡ 激进模式: ring buffer 已最大化"
+  fi
+
   echo "  ✅ 出口网卡: $iface，offload 已检查（新开启 $applied 项）"
 
   # 持久化：写入 udev 规则，开机自动应用
   local udev_file="/etc/udev/rules.d/99-net-optimize-offload.rules"
-  cat > "$udev_file" <<EOF
-# Net-Optimize: NIC offload 持久化
-ACTION=="add", SUBSYSTEM=="net", NAME=="$iface", RUN+="/usr/sbin/ethtool -K $iface gro on gso on tso on sg on tx-nocache-copy on"
-EOF
+  {
+    echo "# Net-Optimize: NIC offload 持久化"
+    echo "ACTION==\"add\", SUBSYSTEM==\"net\", NAME==\"$iface\", RUN+=\"/usr/sbin/ethtool -K $iface gro on gso on tso on sg on tx-nocache-copy on\""
+    if [ "${AGGRESSIVE_MODE:-0}" = "1" ]; then
+      echo "ACTION==\"add\", SUBSYSTEM==\"net\", NAME==\"$iface\", RUN+=\"/usr/sbin/ip link set $iface txqueuelen 10000\""
+    fi
+  } > "$udev_file"
   chmod 644 "$udev_file"
   echo "  ✅ offload 持久化：$udev_file"
 }
@@ -918,14 +972,19 @@ setup_initcwnd() {
   fi
 
   # 根据 RTT 选择 initcwnd
-  # RTT < 50ms（近距离/同区域）: initcwnd=20
-  # RTT 50-150ms（跨洲）: initcwnd=30
-  # RTT > 150ms（高延迟/跨洲代理）: initcwnd=50
+  # 普通模式：
+  #   RTT < 50ms: initcwnd=20 / 50-150ms: initcwnd=30 / >150ms: initcwnd=50
+  # 激进模式：一律 initcwnd=64（最大化初始窗口）
   local initcwnd=20
-  if [ "$avg_rtt" -gt 150 ]; then
-    initcwnd=50
-  elif [ "$avg_rtt" -gt 50 ]; then
-    initcwnd=30
+  if [ "${AGGRESSIVE_MODE:-0}" = "1" ]; then
+    initcwnd=64
+    echo "  ⚡ 激进模式: initcwnd=64（最大初始窗口）"
+  else
+    if [ "$avg_rtt" -gt 150 ]; then
+      initcwnd=50
+    elif [ "$avg_rtt" -gt 50 ]; then
+      initcwnd=30
+    fi
   fi
 
   echo "  ℹ️ 平均 RTT: ${avg_rtt}ms → initcwnd=$initcwnd"
@@ -961,6 +1020,30 @@ setup_initcwnd() {
   fi
 
   echo "  ✅ initcwnd 配置完成"
+}
+
+# === 9.9 激进模式：网卡 tc qdisc 覆盖 ===
+setup_aggressive_tc() {
+  if [ "${AGGRESSIVE_MODE:-0}" != "1" ]; then
+    return 0
+  fi
+
+  echo "⚡ 激进模式：覆盖网卡 tc qdisc..."
+
+  have_cmd tc || { echo "  ⚠️ tc 命令不可用，跳过"; return 0; }
+
+  local iface
+  iface="$(detect_outbound_iface 2>/dev/null || true)"
+  [ -z "$iface" ] && { echo "  ⚠️ 无法检测出口网卡，跳过"; return 0; }
+
+  # 替换网卡 qdisc 为 pfifo_fast（不做流量整形，不限速）
+  tc qdisc replace dev "$iface" root pfifo_fast 2>/dev/null || \
+    tc qdisc replace dev "$iface" root pfifo limit 10000 2>/dev/null || true
+
+  local current_qdisc
+  current_qdisc="$(tc qdisc show dev "$iface" root 2>/dev/null | awk '{print $2}' | head -n1 || true)"
+  echo "  ✅ $iface qdisc 已设置为: ${current_qdisc:-unknown}"
+  echo "  ⚡ 无流量整形，发包不受 AQM 限制"
 }
 
 # === 10. MSS Clamping ===
@@ -1590,10 +1673,16 @@ print_status() {
   echo "==================== 优 化 状 态 报 告 ===================="
 
   printf "📊 基 础 状 态 :\n"
+  if [ "${AGGRESSIVE_MODE:-0}" = "1" ]; then
+    printf "  ⚡ %-20s : %s\n" "激进模式" "已开启"
+  fi
   printf "  %-22s : %s\n" "TCP 拥塞算法" "$(get_sysctl net.ipv4.tcp_congestion_control)"
   printf "  %-22s : %s\n" "默认队列" "$(get_sysctl net.core.default_qdisc)"
   printf "  %-22s : %s\n" "文件句柄限制" "$(ulimit -n)"
   printf "  %-22s : %s bytes\n" "rmem_default" "$(get_sysctl net.core.rmem_default)"
+  printf "  %-22s : %s\n" "tcp_window_scaling" "$(get_sysctl net.ipv4.tcp_window_scaling)"
+  printf "  %-22s : %s\n" "tcp_sack" "$(get_sysctl net.ipv4.tcp_sack)"
+  printf "  %-22s : %s\n" "tcp_notsent_lowat" "$(get_sysctl net.ipv4.tcp_notsent_lowat)"
   echo ""
 
   printf "🌐 网 络 状 态 :\n"
@@ -1697,6 +1786,7 @@ main() {
   setup_mss_clamping
   setup_dscp_marking
   setup_initcwnd
+  setup_aggressive_tc
   fix_nginx_repo
   install_boot_service
 
