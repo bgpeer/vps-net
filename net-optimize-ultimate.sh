@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.3.0
+# 🚀 Net-Optimize-Ultimate v3.4.0
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
-# 基于 v3.2.2 修复：
+# 基于 v3.3.0 修复：
+#   1) check_dpkg_clean 增强：先修→修不好再移除→清理后继续
+#   2) force_apply_sysctl_runtime 增强：逐接口强制覆盖 rp_filter（防云厂商覆盖）
+#   3) apply 开机脚本同步 rp_filter 逐接口覆盖逻辑
+#   4) config 持久化 RP_FILTER 值供 apply 脚本读取
+# 历史修复（v3.3.0）：
 #   1) 自动更新增加 SHA256SUMS 签名校验
 #   2) openssl sha256 解析兼容（$NF 兜底）
 #   3) apply 脚本与主脚本 MSS 逻辑统一（只用默认 iptables 写 1 条）
@@ -89,7 +94,7 @@ install -Dm755 "$0" "$SCRIPT_PATH" 2>/dev/null || true
 
 trap 'code=$?; echo "❌ 出错：第 ${BASH_LINENO[0]} 行 -> ${BASH_COMMAND} (退出码 $code)"; exit $code' ERR
 
-echo "🚀 Net-Optimize-Ultimate v3.3.0 开始执行..."
+echo "🚀 Net-Optimize-Ultimate v3.4.0 开始执行..."
 echo "========================================================"
 
 # === 2. 全局配置开关 ===
@@ -315,6 +320,17 @@ converge_sysctl_authority() {
 force_apply_sysctl_runtime() {
   echo "🧷 强制写入 sysctl runtime（防止云镜像/agent 覆盖）"
   sysctl --system >/dev/null 2>&1 || true
+
+  # 云厂商 systemd-networkd / cloud-init 会按接口覆盖 rp_filter，逐接口强制写回
+  if has_sysctl_key net.ipv4.conf.all.rp_filter; then
+    sysctl -w net.ipv4.conf.all.rp_filter="$RP_FILTER" >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.default.rp_filter="$RP_FILTER" >/dev/null 2>&1 || true
+    local iface_path
+    for iface_path in /proc/sys/net/ipv4/conf/*/rp_filter; do
+      echo "$RP_FILTER" > "$iface_path" 2>/dev/null || true
+    done
+    echo "  ✅ rp_filter 已逐接口强制覆盖为 $RP_FILTER"
+  fi
 }
 
 # === 4. 清理旧配置 ===
@@ -504,7 +520,7 @@ write_sysctl_conf() {
 
   {
     echo "# ========================================================="
-    echo "# 🚀 Net-Optimize Ultimate v3.3.0 - Kernel Parameters"
+    echo "# 🚀 Net-Optimize Ultimate v3.4.0 - Kernel Parameters"
     echo "# Generated: $(date -u '+%F %T UTC')"
     echo "# ========================================================="
     echo
@@ -773,6 +789,7 @@ setup_mss_clamping() {
 ENABLE_MSS_CLAMP=1
 CLAMP_IFACE=$iface
 MSS_VALUE=$MSS_VALUE
+RP_FILTER=$RP_FILTER
 EOF
 
   # 收集可用后端
@@ -947,7 +964,7 @@ CRON
   return 0
 }
 
-# === 12. 开机自启服务（MSS 逻辑与主脚本统一）===
+# === 12. 开机自启服务（MSS + rp_filter 逻辑与主脚本统一）===
 install_boot_service() {
   if [ "$APPLY_AT_BOOT" != "1" ]; then
     echo "⏭️ 跳过开机自启配置"
@@ -969,6 +986,16 @@ fi
 
 sysctl -e --system >/dev/null 2>&1 || true
 
+# === 强制覆盖 rp_filter（防止 cloud-init/systemd-networkd 按接口覆盖）===
+CONFIG_FILE="/etc/net-optimize/config"
+if [ -f "$CONFIG_FILE" ]; then
+  . "$CONFIG_FILE"
+fi
+_RP="${RP_FILTER:-2}"
+for _rp_path in /proc/sys/net/ipv4/conf/*/rp_filter; do
+  echo "$_RP" > "$_rp_path" 2>/dev/null || true
+done
+
 # === conntrack 触发（与主脚本一致：INVALID -> DROP）===
 if command -v iptables >/dev/null 2>&1; then
   iptables -t filter -C INPUT  -m conntrack --ctstate INVALID -j DROP 2>/dev/null \
@@ -985,7 +1012,6 @@ if command -v curl >/dev/null 2>&1; then
 fi
 
 # === MSS Clamping（与主脚本统一：只用默认 iptables 写 1 条）===
-CONFIG_FILE="/etc/net-optimize/config"
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
 
@@ -1024,7 +1050,7 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 fi
 
-echo "[$(date)] Net-Optimize v3.3.0 开机优化完成"
+echo "[$(date)] Net-Optimize v3.4.0 开机优化完成"
 APPLYEOF
 
   chmod +x "$APPLY_SCRIPT"
@@ -1032,7 +1058,7 @@ APPLYEOF
   cat > /etc/systemd/system/net-optimize.service <<'EOF'
 [Unit]
 Description=Net-Optimize Ultimate Boot Optimization
-After=network-online.target
+After=network-online.target systemd-sysctl.service cloud-init.service
 Wants=network-online.target
 
 [Service]
@@ -1141,7 +1167,7 @@ print_status() {
 main() {
   require_root
 
-  echo "🚀 Net-Optimize-Ultimate v3.3.0 启动..."
+  echo "🚀 Net-Optimize-Ultimate v3.4.0 启动..."
   echo "========================================================"
 
   clean_old_config
