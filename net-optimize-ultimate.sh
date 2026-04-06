@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.4.0
+# 🚀 Net-Optimize-Ultimate v3.5.0
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
-# 基于 v3.3.0 修复：
-#   1) check_dpkg_clean 增强：先修→修不好再移除→清理后继续
-#   2) force_apply_sysctl_runtime 增强：逐接口强制覆盖 rp_filter（防云厂商覆盖）
-#   3) apply 开机脚本同步 rp_filter 逐接口覆盖逻辑
-#   4) config 持久化 RP_FILTER 值供 apply 脚本读取
-# 历史修复（v3.3.0）：
-#   1) 自动更新增加 SHA256SUMS 签名校验
-#   2) openssl sha256 解析兼容（$NF 兜底）
-#   3) apply 脚本与主脚本 MSS 逻辑统一（只用默认 iptables 写 1 条）
-#   4) conntrack 触发规则统一（apply + 主脚本一致：INVALID DROP）
-#   5) 清理 BBR 下无效的旧参数（tcp_low_latency / tcp_fack / tcp_frto）
-#   6) rp_filter 改为可配置（默认 2 松散模式）
+# v3.5.0 新增：
+#   1) 网卡 offload 优化（GRO/GSO/TSO 自动开启）
+#   2) RPS/RFS 多核收包均衡（自动检测 CPU 核数）
+#   3) TCP 参数微调（window_scaling / sack / notsent_lowat 代理优化）
+#   4) IPv6 MSS clamping（ip6tables 支持）
+#   5) QUIC/UDP DSCP 优先级标记（EF 加速）
+#   6) 自动检测线路质量，高延迟线路加大 initcwnd
+# 历史修复见 changelog
 # ==============================================================================
 
 set -euo pipefail
@@ -94,7 +90,7 @@ install -Dm755 "$0" "$SCRIPT_PATH" 2>/dev/null || true
 
 trap 'code=$?; echo "❌ 出错：第 ${BASH_LINENO[0]} 行 -> ${BASH_COMMAND} (退出码 $code)"; exit $code' ERR
 
-echo "🚀 Net-Optimize-Ultimate v3.4.0 开始执行..."
+echo "🚀 Net-Optimize-Ultimate v3.5.0 开始执行..."
 echo "========================================================"
 
 # === 2. 全局配置开关 ===
@@ -108,6 +104,12 @@ echo "========================================================"
 : "${SKIP_APT:=0}"
 : "${APPLY_AT_BOOT:=1}"
 : "${RP_FILTER:=2}"  # 0=关闭 1=严格 2=松散（默认松散，兼顾代理+安全）
+: "${ENABLE_NIC_OFFLOAD:=1}"    # 网卡 offload（GRO/GSO/TSO）
+: "${ENABLE_RPS_RFS:=1}"        # RPS/RFS 多核收包均衡
+: "${ENABLE_IPV6_MSS:=1}"       # IPv6 MSS clamping
+: "${ENABLE_DSCP:=1}"           # QUIC/UDP DSCP 优先级标记
+: "${ENABLE_INITCWND:=1}"       # 自动检测线路质量调整 initcwnd
+: "${TCP_NOTSENT_LOWAT:=4096}"  # 代理场景低延迟（默认 4096，原 16384）
 
 # 路径定义
 CONFIG_DIR="/etc/net-optimize"
@@ -527,7 +529,7 @@ write_sysctl_conf() {
 
   {
     echo "# ========================================================="
-    echo "# 🚀 Net-Optimize Ultimate v3.4.0 - Kernel Parameters"
+    echo "# 🚀 Net-Optimize Ultimate v3.5.0 - Kernel Parameters"
     echo "# Generated: $(date -u '+%F %T UTC')"
     echo "# ========================================================="
     echo
@@ -560,11 +562,13 @@ write_sysctl_conf() {
 
     echo "# === TCP算法优化 ==="
     echo "net.ipv4.tcp_mtu_probing = $ENABLE_MTU_PROBE"
+    echo "net.ipv4.tcp_window_scaling = 1"
+    echo "net.ipv4.tcp_sack = 1"
     echo "net.ipv4.tcp_slow_start_after_idle = 0"
     echo "net.ipv4.tcp_no_metrics_save = 0"
     echo "net.ipv4.tcp_ecn = 1"
     echo "net.ipv4.tcp_ecn_fallback = 1"
-    echo "net.ipv4.tcp_notsent_lowat = 16384"
+    echo "net.ipv4.tcp_notsent_lowat = $TCP_NOTSENT_LOWAT"
     echo "net.ipv4.tcp_fastopen = 3"
     echo "net.ipv4.tcp_timestamps = 1"
     echo "net.ipv4.tcp_autocorking = 0"
@@ -721,6 +725,242 @@ setup_conntrack() {
   fi
 
   echo "✅ 连接跟踪配置完成"
+}
+
+# === 9.5 网卡 Offload 优化（GRO/GSO/TSO）===
+setup_nic_offload() {
+  if [ "${ENABLE_NIC_OFFLOAD:-1}" != "1" ]; then
+    echo "⏭️ 跳过网卡 offload 优化"
+    return 0
+  fi
+
+  echo "🔧 网卡 offload 优化..."
+
+  have_cmd ethtool || { echo "  ⚠️ ethtool 未安装，跳过"; return 0; }
+
+  local iface
+  iface="$(detect_outbound_iface 2>/dev/null || true)"
+  [ -z "$iface" ] && { echo "  ⚠️ 无法检测出口网卡，跳过"; return 0; }
+
+  local feature applied=0
+  for feature in gro gso tso sg rx-checksumming tx-checksumming; do
+    if ethtool -k "$iface" 2>/dev/null | grep -qE "^${feature}:.*off"; then
+      ethtool -K "$iface" "$feature" on 2>/dev/null && applied=$((applied + 1)) || true
+    fi
+  done
+
+  # 开启 tx-nocache-copy 减少代理场景 CPU 拷贝
+  ethtool -K "$iface" tx-nocache-copy on 2>/dev/null || true
+
+  echo "  ✅ 出口网卡: $iface，offload 已检查（新开启 $applied 项）"
+
+  # 持久化：写入 udev 规则，开机自动应用
+  local udev_file="/etc/udev/rules.d/99-net-optimize-offload.rules"
+  cat > "$udev_file" <<EOF
+# Net-Optimize: NIC offload 持久化
+ACTION=="add", SUBSYSTEM=="net", NAME=="$iface", RUN+="/usr/sbin/ethtool -K $iface gro on gso on tso on sg on tx-nocache-copy on"
+EOF
+  chmod 644 "$udev_file"
+  echo "  ✅ offload 持久化：$udev_file"
+}
+
+# === 9.6 RPS/RFS 多核收包均衡 ===
+setup_rps_rfs() {
+  if [ "${ENABLE_RPS_RFS:-1}" != "1" ]; then
+    echo "⏭️ 跳过 RPS/RFS 配置"
+    return 0
+  fi
+
+  echo "🔧 RPS/RFS 多核收包均衡..."
+
+  local iface
+  iface="$(detect_outbound_iface 2>/dev/null || true)"
+  [ -z "$iface" ] && { echo "  ⚠️ 无法检测出口网卡，跳过"; return 0; }
+
+  local ncpu
+  ncpu="$(nproc 2>/dev/null || echo 1)"
+  [ "$ncpu" -le 1 ] && { echo "  ℹ️ 单核 CPU，RPS/RFS 无需配置"; return 0; }
+
+  # 计算 CPU 掩码：所有核参与（例如 4 核 = f，8 核 = ff）
+  local cpu_mask
+  cpu_mask="$(printf '%x' $(( (1 << ncpu) - 1 )))"
+
+  # RPS：设置每个 rx queue 的 CPU 掩码
+  local rps_applied=0
+  local queue_dir
+  for queue_dir in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
+    [ -f "$queue_dir" ] || continue
+    echo "$cpu_mask" > "$queue_dir" 2>/dev/null && rps_applied=$((rps_applied + 1)) || true
+  done
+
+  # RFS：设置全局 flow 表大小和每队列 flow 数
+  local rfs_entries=$(( 32768 * ncpu ))
+  if [ -f /proc/sys/net/core/rps_sock_flow_entries ]; then
+    echo "$rfs_entries" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+  fi
+
+  local rfs_per_queue=$(( rfs_entries / (rps_applied > 0 ? rps_applied : 1) ))
+  for queue_dir in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
+    [ -f "$queue_dir" ] || continue
+    echo "$rfs_per_queue" > "$queue_dir" 2>/dev/null || true
+  done
+
+  echo "  ✅ $iface: RPS 掩码=$cpu_mask (${ncpu}核), RFS entries=$rfs_entries, queues=$rps_applied"
+
+  # 持久化：写入 systemd-tmpfiles
+  local tmpfiles_conf="/etc/tmpfiles.d/net-optimize-rps.conf"
+  {
+    echo "# Net-Optimize: RPS/RFS 持久化"
+    echo "w /proc/sys/net/core/rps_sock_flow_entries - - - - $rfs_entries"
+    for queue_dir in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
+      [ -f "$queue_dir" ] && echo "w $queue_dir - - - - $cpu_mask"
+    done
+    for queue_dir in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
+      [ -f "$queue_dir" ] && echo "w $queue_dir - - - - $rfs_per_queue"
+    done
+  } > "$tmpfiles_conf"
+  chmod 644 "$tmpfiles_conf"
+  echo "  ✅ RPS/RFS 持久化：$tmpfiles_conf"
+}
+
+# === 9.7 QUIC/UDP DSCP 优先级标记 ===
+setup_dscp_marking() {
+  if [ "${ENABLE_DSCP:-1}" != "1" ]; then
+    echo "⏭️ 跳过 DSCP 标记"
+    return 0
+  fi
+
+  echo "🏷️ QUIC/UDP DSCP 优先级标记..."
+
+  local ipt_backend
+  ipt_backend="$(_nopt_detect_ipt_backend)"
+  [ -z "$ipt_backend" ] && { echo "  ⚠️ iptables 不可用，跳过"; return 0; }
+
+  local iface
+  iface="$(detect_outbound_iface 2>/dev/null || true)"
+
+  # DSCP EF (46 = 0x2E) 用于 UDP 443 (QUIC) 出口流量加速
+  # 清理旧规则
+  for cmd in iptables iptables-legacy iptables-nft; do
+    have_cmd "$cmd" || continue
+    "$cmd" -t mangle -S POSTROUTING 2>/dev/null \
+      | grep -E 'DSCP.*0x2e' \
+      | while IFS= read -r rule; do
+          del="${rule/-A POSTROUTING/-D POSTROUTING}"
+          read -r -a parts <<<"$del"
+          "$cmd" -t mangle "${parts[@]}" 2>/dev/null || true
+        done || true
+  done
+
+  # 写入新规则：UDP 443 (QUIC) 标记为 EF
+  local rule_opts="-p udp --dport 443 -j DSCP --set-dscp-class EF"
+  if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
+    "$ipt_backend" -t mangle -A POSTROUTING -o "$iface" $rule_opts 2>/dev/null || true
+  else
+    "$ipt_backend" -t mangle -A POSTROUTING $rule_opts 2>/dev/null || true
+  fi
+
+  # IPv6 DSCP（如果有 ip6tables 对应后端）
+  local ip6_cmd=""
+  if [ "$ipt_backend" = "iptables-legacy" ] && have_cmd ip6tables-legacy; then
+    ip6_cmd="ip6tables-legacy"
+  elif have_cmd ip6tables; then
+    ip6_cmd="ip6tables"
+  fi
+
+  if [ -n "$ip6_cmd" ]; then
+    # 清理旧 IPv6 DSCP
+    "$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null \
+      | grep -E 'DSCP.*0x2e' \
+      | while IFS= read -r rule; do
+          del="${rule/-A POSTROUTING/-D POSTROUTING}"
+          read -r -a parts <<<"$del"
+          "$ip6_cmd" -t mangle "${parts[@]}" 2>/dev/null || true
+        done || true
+
+    if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
+      "$ip6_cmd" -t mangle -A POSTROUTING -o "$iface" $rule_opts 2>/dev/null || true
+    else
+      "$ip6_cmd" -t mangle -A POSTROUTING $rule_opts 2>/dev/null || true
+    fi
+  fi
+
+  echo "  ✅ UDP 443 (QUIC) DSCP=EF 已标记（$ipt_backend）"
+}
+
+# === 9.8 自动检测线路质量 + initcwnd 调整 ===
+setup_initcwnd() {
+  if [ "${ENABLE_INITCWND:-1}" != "1" ]; then
+    echo "⏭️ 跳过 initcwnd 自动调整"
+    return 0
+  fi
+
+  echo "📡 检测线路质量，自动调整 initcwnd..."
+
+  # 测量到几个目标的 RTT
+  local total_rtt=0 count=0 rtt
+  for target in 1.1.1.1 8.8.8.8 9.9.9.9; do
+    rtt="$(ping -c 3 -W 2 "$target" 2>/dev/null \
+      | awk -F'/' '/^rtt|^round-trip/ {print $5}' | head -n1 || true)"
+    if [ -n "$rtt" ] && [ "$rtt" != "0" ]; then
+      # 取整数部分
+      local rtt_int="${rtt%%.*}"
+      [ -n "$rtt_int" ] && [ "$rtt_int" -gt 0 ] 2>/dev/null && {
+        total_rtt=$((total_rtt + rtt_int))
+        count=$((count + 1))
+      }
+    fi
+  done
+
+  local avg_rtt=0
+  if [ "$count" -gt 0 ]; then
+    avg_rtt=$((total_rtt / count))
+  fi
+
+  # 根据 RTT 选择 initcwnd
+  # RTT < 50ms（近距离/同区域）: initcwnd=20
+  # RTT 50-150ms（跨洲）: initcwnd=30
+  # RTT > 150ms（高延迟/跨洲代理）: initcwnd=50
+  local initcwnd=20
+  if [ "$avg_rtt" -gt 150 ]; then
+    initcwnd=50
+  elif [ "$avg_rtt" -gt 50 ]; then
+    initcwnd=30
+  fi
+
+  echo "  ℹ️ 平均 RTT: ${avg_rtt}ms → initcwnd=$initcwnd"
+
+  # 获取默认路由并设置 initcwnd + initrwnd
+  local default_gw
+  default_gw="$(ip -4 route show default 2>/dev/null | head -n1 || true)"
+  if [ -n "$default_gw" ]; then
+    # 检查是否已有 initcwnd
+    if echo "$default_gw" | grep -q 'initcwnd'; then
+      # 替换现有值
+      ip route change $default_gw initcwnd "$initcwnd" initrwnd "$initcwnd" 2>/dev/null || true
+    else
+      ip route change $default_gw initcwnd "$initcwnd" initrwnd "$initcwnd" 2>/dev/null || true
+    fi
+    echo "  ✅ IPv4 默认路由 initcwnd=$initcwnd initrwnd=$initcwnd"
+  fi
+
+  # IPv6 默认路由
+  local default_gw6
+  default_gw6="$(ip -6 route show default 2>/dev/null | head -n1 || true)"
+  if [ -n "$default_gw6" ]; then
+    ip -6 route change $default_gw6 initcwnd "$initcwnd" initrwnd "$initcwnd" 2>/dev/null || true
+    echo "  ✅ IPv6 默认路由 initcwnd=$initcwnd initrwnd=$initcwnd"
+  fi
+
+  # 持久化到 config（供 apply 脚本用）
+  if [ -f "$CONFIG_FILE" ]; then
+    # 追加或更新
+    grep -q '^INITCWND=' "$CONFIG_FILE" 2>/dev/null \
+      && sed -i "s/^INITCWND=.*/INITCWND=$initcwnd/" "$CONFIG_FILE" \
+      || echo "INITCWND=$initcwnd" >> "$CONFIG_FILE"
+  fi
+
+  echo "  ✅ initcwnd 配置完成"
 }
 
 # === 10. MSS Clamping ===
@@ -927,6 +1167,55 @@ EOF
   fi
 
   echo "✅ MSS Clamping 设置完成"
+
+  # === IPv6 MSS Clamping ===
+  if [ "${ENABLE_IPV6_MSS:-1}" = "1" ]; then
+    echo "📡 设置 IPv6 MSS Clamping..."
+
+    # 检测 IPv6 对应后端
+    local ip6_cmd=""
+    if [ "$ipt_backend" = "iptables-legacy" ] && have_cmd ip6tables-legacy; then
+      ip6_cmd="ip6tables-legacy"
+    elif have_cmd ip6tables; then
+      ip6_cmd="ip6tables"
+    fi
+
+    if [ -n "$ip6_cmd" ]; then
+      # 清理旧 IPv6 TCPMSS
+      local ip6_round=0
+      while :; do
+        local ip6_rules
+        ip6_rules="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'TCPMSS' || true)"
+        [ -z "$ip6_rules" ] && break
+        ip6_round=$((ip6_round + 1))
+        [ "$ip6_round" -gt 40 ] && break
+        while IFS= read -r rule; do
+          [ -z "$rule" ] && continue
+          local del6="${rule/-A POSTROUTING/-D POSTROUTING}"
+          local -a parts6
+          read -r -a parts6 <<<"$del6"
+          "$ip6_cmd" -t mangle "${parts6[@]}" 2>/dev/null || true
+        done <<<"$ip6_rules"
+      done
+
+      # 写入 IPv6 MSS 规则（MSS 值与 IPv4 一致）
+      local ipv6_mss=$((MSS_VALUE - 20))  # IPv6 头比 IPv4 大 20 字节
+      if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
+        "$ip6_cmd" -t mangle -A POSTROUTING -o "$iface" -p tcp --tcp-flags SYN,RST SYN \
+          -j TCPMSS --set-mss "$ipv6_mss" 2>/dev/null || true
+      else
+        "$ip6_cmd" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+          -j TCPMSS --set-mss "$ipv6_mss" 2>/dev/null || true
+      fi
+
+      local ip6_cnt
+      ip6_cnt="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+      ip6_cnt="${ip6_cnt%%$'\n'*}"; ip6_cnt="${ip6_cnt:-0}"
+      echo "  ✅ IPv6 MSS=$ipv6_mss ($ip6_cmd), 规则数：$ip6_cnt"
+    else
+      echo "  ℹ️ ip6tables 不可用，跳过 IPv6 MSS"
+    fi
+  fi
 }
 
 # === 11. Nginx 安装 + 自动更新 ===
@@ -1194,7 +1483,80 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 fi
 
-echo "[$(date)] Net-Optimize v3.4.0 开机优化完成"
+# === IPv6 MSS Clamping（开机恢复）===
+if [ -f "$CONFIG_FILE" ]; then
+  . "$CONFIG_FILE"
+  if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
+    MSS="${MSS_VALUE:-1452}"
+    IFACE="${CLAMP_IFACE:-}"
+    IPV6_MSS=$((MSS - 20))
+
+    IP6_CMD=""
+    if [ "${IPT:-iptables}" = "iptables-legacy" ] && command -v ip6tables-legacy >/dev/null 2>&1; then
+      IP6_CMD="ip6tables-legacy"
+    elif command -v ip6tables >/dev/null 2>&1; then
+      IP6_CMD="ip6tables"
+    fi
+
+    if [ -n "$IP6_CMD" ]; then
+      # 清理旧规则
+      while :; do
+        _r6="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' || true)"
+        [ -z "$_r6" ] && break
+        while IFS= read -r rule; do
+          [ -z "$rule" ] && continue
+          del="${rule/-A POSTROUTING/-D POSTROUTING}"
+          read -r -a parts <<<"$del"
+          "$IP6_CMD" -t mangle "${parts[@]}" 2>/dev/null || true
+        done <<<"$_r6"
+      done
+      # 写入
+      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+        "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+          -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null || true
+      else
+        "$IP6_CMD" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+          -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null || true
+      fi
+    fi
+  fi
+fi
+
+# === DSCP 标记恢复（UDP 443 QUIC → EF）===
+if [ -f "$CONFIG_FILE" ]; then
+  . "$CONFIG_FILE"
+  IPT="${IPT_BACKEND:-iptables}"
+  command -v "$IPT" >/dev/null 2>&1 || IPT="iptables"
+  IFACE="${CLAMP_IFACE:-}"
+
+  if command -v "$IPT" >/dev/null 2>&1; then
+    _dscp_opts="-p udp --dport 443 -j DSCP --set-dscp-class EF"
+    # 清理旧 DSCP
+    "$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x2e' | while IFS= read -r rule; do
+      del="${rule/-A POSTROUTING/-D POSTROUTING}"
+      read -r -a parts <<<"$del"
+      "$IPT" -t mangle "${parts[@]}" 2>/dev/null || true
+    done || true
+    # 写入
+    if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+      "$IPT" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
+    else
+      "$IPT" -t mangle -A POSTROUTING $_dscp_opts 2>/dev/null || true
+    fi
+  fi
+fi
+
+# === initcwnd 恢复 ===
+if [ -f "$CONFIG_FILE" ]; then
+  . "$CONFIG_FILE"
+  _cwnd="${INITCWND:-20}"
+  _dgw="$(ip -4 route show default 2>/dev/null | head -n1 || true)"
+  [ -n "$_dgw" ] && ip route change $_dgw initcwnd "$_cwnd" initrwnd "$_cwnd" 2>/dev/null || true
+  _dgw6="$(ip -6 route show default 2>/dev/null | head -n1 || true)"
+  [ -n "$_dgw6" ] && ip -6 route change $_dgw6 initcwnd "$_cwnd" initrwnd "$_cwnd" 2>/dev/null || true
+fi
+
+echo "[$(date)] Net-Optimize v3.5.0 开机优化完成"
 APPLYEOF
 
   chmod +x "$APPLY_SCRIPT"
@@ -1319,7 +1681,7 @@ print_status() {
 main() {
   require_root
 
-  echo "🚀 Net-Optimize-Ultimate v3.4.0 启动..."
+  echo "🚀 Net-Optimize-Ultimate v3.5.0 启动..."
   echo "========================================================"
 
   clean_old_config
@@ -1330,7 +1692,11 @@ main() {
   converge_sysctl_authority
   force_apply_sysctl_runtime
   setup_conntrack
+  setup_nic_offload
+  setup_rps_rfs
   setup_mss_clamping
+  setup_dscp_marking
+  setup_initcwnd
   fix_nginx_repo
   install_boot_service
 
