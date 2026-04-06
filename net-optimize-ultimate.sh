@@ -1018,9 +1018,14 @@ setup_initcwnd() {
 
   echo "  ℹ️ 平均 RTT: ${avg_rtt}ms → initcwnd=$initcwnd"
 
-  # 辅助函数：从路由字符串中剥离已有的 initcwnd/initrwnd 参数
-  _strip_cwnd() {
-    echo "$1" | sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g'
+  # 辅助函数：从路由字符串中剥离 ip route change 不接受的参数
+  _strip_route_params() {
+    echo "$1" | sed -E \
+      's/ initcwnd [0-9]+//g;
+       s/ initrwnd [0-9]+//g;
+       s/ expires [0-9]+sec//g;
+       s/ hoplimit [0-9]+//g;
+       s/ pref [a-z]+//g'
   }
 
   # 获取默认路由并设置 initcwnd + initrwnd
@@ -1028,7 +1033,7 @@ setup_initcwnd() {
   default_gw="$(ip -4 route show default 2>/dev/null | head -n1 || true)"
   if [ -n "$default_gw" ]; then
     local clean_gw
-    clean_gw="$(_strip_cwnd "$default_gw")"
+    clean_gw="$(_strip_route_params "$default_gw")"
     ip route change $clean_gw initcwnd "$initcwnd" initrwnd "$initcwnd" 2>/dev/null || true
     echo "  ✅ IPv4 默认路由 initcwnd=$initcwnd initrwnd=$initcwnd"
   fi
@@ -1038,7 +1043,7 @@ setup_initcwnd() {
   default_gw6="$(ip -6 route show default 2>/dev/null | head -n1 || true)"
   if [ -n "$default_gw6" ]; then
     local clean_gw6
-    clean_gw6="$(_strip_cwnd "$default_gw6")"
+    clean_gw6="$(_strip_route_params "$default_gw6")"
     ip -6 route change $clean_gw6 initcwnd "$initcwnd" initrwnd "$initcwnd" 2>/dev/null || true
     echo "  ✅ IPv6 默认路由 initcwnd=$initcwnd initrwnd=$initcwnd"
   fi
@@ -1688,15 +1693,22 @@ fi
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
   _cwnd="${INITCWND:-20}"
-  _strip_cwnd() { echo "$1" | sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g'; }
+  _strip_route_params() {
+    echo "$1" | sed -E \
+      's/ initcwnd [0-9]+//g;
+       s/ initrwnd [0-9]+//g;
+       s/ expires [0-9]+sec//g;
+       s/ hoplimit [0-9]+//g;
+       s/ pref [a-z]+//g'
+  }
   _dgw="$(ip -4 route show default 2>/dev/null | head -n1 || true)"
   if [ -n "$_dgw" ]; then
-    _dgw_clean="$(_strip_cwnd "$_dgw")"
+    _dgw_clean="$(_strip_route_params "$_dgw")"
     ip route change $_dgw_clean initcwnd "$_cwnd" initrwnd "$_cwnd" 2>/dev/null || true
   fi
   _dgw6="$(ip -6 route show default 2>/dev/null | head -n1 || true)"
   if [ -n "$_dgw6" ]; then
-    _dgw6_clean="$(_strip_cwnd "$_dgw6")"
+    _dgw6_clean="$(_strip_route_params "$_dgw6")"
     ip -6 route change $_dgw6_clean initcwnd "$_cwnd" initrwnd "$_cwnd" 2>/dev/null || true
   fi
 fi
