@@ -1066,17 +1066,17 @@ if [ -f "$CONFIG_FILE" ]; then
       fi
 
       # 自动去重（保留最后 1 条，删除多余）
-      local _dedup_cnt _dedup_r=0
+      _dedup_cnt=0
+      _dedup_r=0
       while :; do
         _dedup_cnt="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
         _dedup_cnt="${_dedup_cnt%%$'\n'*}"; _dedup_cnt="${_dedup_cnt:-0}"
         [ "$_dedup_cnt" -le 1 ] && break
         _dedup_r=$((_dedup_r + 1))
         [ "$_dedup_r" -gt 20 ] && break
-        local _first
         _first="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
         [ -z "$_first" ] && break
-        local _del="${_first/-A POSTROUTING/-D POSTROUTING}"
+        _del="${_first/-A POSTROUTING/-D POSTROUTING}"
         read -r -a _parts <<<"$_del"
         iptables -t mangle "${_parts[@]}" 2>/dev/null || break
       done
