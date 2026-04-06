@@ -318,10 +318,7 @@ echo "💻 [11] 系统信息"
 sep
 printf "  %-10s: %s\n" "内核" "$(uname -r)"
 printf "  %-10s: %s\n" "CPU" "$(nproc 2>/dev/null || echo '?') 核"
-if has free; then
-  printf "  %-10s: %s\n" "内存" "$(free -h 2>/dev/null | awk '/^Mem:/{print $2}')"
-  printf "  %-10s: %s\n" "可用" "$(free -h 2>/dev/null | awk '/^Mem:/{print $7}')"
-elif [[ -f /proc/meminfo ]]; then
+if [[ -f /proc/meminfo ]]; then
   _mem_total="$(awk '/^MemTotal:/{printf "%.0f MB", $2/1024}' /proc/meminfo 2>/dev/null || echo '?')"
   _mem_avail="$(awk '/^MemAvailable:/{printf "%.0f MB", $2/1024}' /proc/meminfo 2>/dev/null || echo '?')"
   printf "  %-10s: %s\n" "内存" "$_mem_total"
