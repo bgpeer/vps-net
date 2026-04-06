@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🔍 Net-Optimize 状态检测脚本 v1.1（配合 v3.3.0）
+# 🔍 Net-Optimize 状态检测脚本 v1.2（配合 v3.4.0）
+# 修复：iptables 多后端检测（nft / legacy 自动遍历）
 # ==============================================================================
 set -euo pipefail
 
@@ -42,7 +43,41 @@ svc_state() {
   fi
 }
 
-echo "🔍 开始系统状态检测（Net-Optimize v3.3.0 + Nginx）..."
+# --- 检测实际可用的 iptables 后端 ---
+# 返回能看到 TCPMSS 规则的后端，如果都没有则返回有 legacy 警告时优先 legacy
+detect_ipt_backend() {
+  local cmd
+  # 优先返回有 TCPMSS 规则的后端
+  for cmd in iptables iptables-legacy iptables-nft; do
+    has "$cmd" || continue
+    local cnt
+    cnt="$("$cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+    cnt="${cnt%%$'\n'*}"; cnt="${cnt:-0}"
+    if [ "$cnt" -gt 0 ]; then
+      echo "$cmd"
+      return 0
+    fi
+  done
+  # 没有规则时，检测默认 iptables 是否有 legacy 警告
+  if has iptables; then
+    local warn
+    warn="$(iptables -t mangle -S POSTROUTING 2>&1 || true)"
+    if echo "$warn" | grep -qi 'iptables-legacy' && has iptables-legacy; then
+      echo "iptables-legacy"
+      return 0
+    fi
+    echo "iptables"
+    return 0
+  fi
+  if has iptables-legacy; then echo "iptables-legacy"; return 0; fi
+  if has iptables-nft; then echo "iptables-nft"; return 0; fi
+  echo ""
+}
+
+# 检测后端（全局使用）
+IPT_CMD="$(detect_ipt_backend)"
+
+echo "🔍 开始系统状态检测（Net-Optimize v3.4.0 + Nginx）..."
 title
 
 # =================================================================
@@ -74,7 +109,7 @@ echo "  🔹 wmem_default = $(get net.core.wmem_default)"
 echo "  🔹 rmem_max     = $(get net.core.rmem_max)"
 echo "  🔹 wmem_max     = $(get net.core.wmem_max)"
 
-# rp_filter（v3.3.0 新增可配置项）
+# rp_filter
 rp="$(get net.ipv4.conf.all.rp_filter)"
 case "$rp" in
   0) yellow "⚠️ rp_filter = 0（关闭，无 IP spoofing 防护）" ;;
@@ -134,18 +169,23 @@ if has lsmod; then
   fi
 fi
 
-# conntrack 触发规则检测（v3.3.0 统一为 INVALID DROP）
-if has iptables; then
-  inv_input="$(iptables -t filter -S INPUT 2>/dev/null | grep -c 'conntrack.*INVALID.*DROP' || true)"
-  inv_output="$(iptables -t filter -S OUTPUT 2>/dev/null | grep -c 'conntrack.*INVALID.*DROP' || true)"
+# conntrack 触发规则检测（遍历所有后端）
+_ct_found=0
+for _ct_cmd in iptables iptables-legacy iptables-nft; do
+  has "$_ct_cmd" || continue
+  inv_input="$("$_ct_cmd" -t filter -S INPUT 2>/dev/null | grep -c 'conntrack.*INVALID.*DROP' || true)"
+  inv_output="$("$_ct_cmd" -t filter -S OUTPUT 2>/dev/null | grep -c 'conntrack.*INVALID.*DROP' || true)"
   inv_input="${inv_input%%$'\n'*}"; inv_input="${inv_input:-0}"
   inv_output="${inv_output%%$'\n'*}"; inv_output="${inv_output:-0}"
 
   if [[ "$inv_input" -ge 1 && "$inv_output" -ge 1 ]]; then
-    green "✅ conntrack 触发规则：INVALID DROP（INPUT + OUTPUT）"
-  else
-    yellow "⚠️ conntrack 触发规则不完整：INPUT=$inv_input, OUTPUT=$inv_output"
+    green "✅ conntrack 触发规则：INVALID DROP（INPUT + OUTPUT）[$_ct_cmd]"
+    _ct_found=1
+    break
   fi
+done
+if [[ "$_ct_found" -eq 0 ]]; then
+  yellow "⚠️ conntrack 触发规则不完整（所有后端均未检测到 INVALID DROP）"
 fi
 
 # =================================================================
@@ -172,21 +212,27 @@ sep
 echo "📡 [4] MSS Clamping 规则"
 sep
 
-if has iptables; then
-  echo "✅ iptables mangle/POSTROUTING："
-  iptables -t mangle -L POSTROUTING -n -v 2>/dev/null | grep -E 'TCPMSS|Chain|pkts|bytes' || echo "  (none)"
+_mss_found=0
+for _cmd in iptables iptables-legacy iptables-nft; do
+  has "$_cmd" || continue
+  _cnt="$("$_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+  _cnt="${_cnt%%$'\n'*}"; _cnt="${_cnt:-0}"
+  [ "$_cnt" -eq 0 ] && continue
 
-  dup="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-  dup="${dup%%$'\n'*}"; dup="${dup:-0}"
-  if [[ "$dup" -gt 1 ]]; then
-    yellow "⚠️ 发现多条 TCPMSS 规则：$dup 条（可能重复叠加）"
-  elif [[ "$dup" -eq 1 ]]; then
-    green "✅ TCPMSS 规则数量：1（正常）"
+  _mss_found=1
+  echo "✅ $_cmd mangle/POSTROUTING："
+  "$_cmd" -t mangle -L POSTROUTING -n -v 2>/dev/null | grep -E 'TCPMSS|Chain|pkts|bytes' || true
+
+  if [ "$_cnt" -gt 1 ]; then
+    yellow "⚠️ 发现多条 TCPMSS 规则：$_cnt 条（可能重复叠加）"
   else
-    echo "  ℹ️ 未发现 TCPMSS 规则"
+    green "✅ TCPMSS 规则数量：1（正常）"
   fi
-else
-  echo "  (iptables not installed)"
+  break
+done
+
+if [ "$_mss_found" -eq 0 ]; then
+  yellow "⚠️ 所有 iptables 后端均未发现 TCPMSS 规则"
 fi
 
 if has nft; then
@@ -267,7 +313,6 @@ if [[ -f "$SYSCTL_FILE" ]]; then
   for k in "${check_keys[@]}"; do
     rt="$(get "$k")"
 
-    # 从文件中提取值（保留空格，处理多值参数如 tcp_rmem）
     fv="$(awk -v kk="$k" '
       $0 ~ "^[[:space:]]*#" {next}
       $1 == kk && $2 == "=" {
@@ -278,7 +323,6 @@ if [[ -f "$SYSCTL_FILE" ]]; then
     ' "$SYSCTL_FILE" 2>/dev/null | tail -n1)"
     fv="${fv:-N/A}"
 
-    # 归一化空格再比较（runtime 可能用 tab，file 用空格）
     rt_norm="$(echo "$rt" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
     fv_norm="$(echo "$fv" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
 
@@ -309,14 +353,12 @@ sep
 
 svc_state "net-optimize.service"
 
-# apply 脚本检查
 if [[ -x /usr/local/sbin/net-optimize-apply ]]; then
   green "✅ apply 脚本：/usr/local/sbin/net-optimize-apply"
 else
   yellow "⚠️ apply 脚本不存在或不可执行"
 fi
 
-# 模块加载配置
 if [[ -f /etc/modules-load.d/conntrack.conf ]]; then
   green "✅ conntrack 模块开机加载：/etc/modules-load.d/conntrack.conf"
 else
@@ -344,7 +386,6 @@ else
     green "✅ 检测到 ondrej/nginx PPA 源"
   fi
 
-  # Pin 检测
   if [[ -f /etc/apt/preferences.d/99-nginx-official ]]; then
     green "✅ nginx.org Pin 优先级已配置"
   else
@@ -418,12 +459,16 @@ printf "  %-14s : %s\n" "总内存" "$(free -h | awk '/^Mem:/ {print $2}')"
 printf "  %-14s : %s\n" "可用内存" "$(free -h | awk '/^Mem:/ {print $NF}')"
 printf "  %-14s : %s\n" "运行时间" "$(uptime -p 2>/dev/null || uptime | sed 's/.*up /up /' | sed 's/,.*//')"
 
-# 脚本版本检测
 if [[ -f /usr/local/sbin/net-optimize-ultimate.sh ]]; then
   script_ver="$(grep -oP 'v\d+\.\d+\.\d+' /usr/local/sbin/net-optimize-ultimate.sh | head -n1 || echo "unknown")"
   green "✅ 已安装脚本版本：$script_ver"
 else
   yellow "⚠️ 未发现已安装的 net-optimize-ultimate.sh"
+fi
+
+# iptables 后端信息
+if [[ -n "$IPT_CMD" ]]; then
+  echo "  ℹ️ iptables 实际后端：$IPT_CMD"
 fi
 
 title
