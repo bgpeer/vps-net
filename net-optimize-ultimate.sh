@@ -776,10 +776,14 @@ _nopt_apply_one_tcpmss() {
 # --- 检测 iptables 实际可用后端 ---
 # 有些系统同时装了 iptables-nft 和 iptables-legacy，默认 iptables 指向 nft，
 # 但 legacy tables 存在时 nft 后端写入会静默失败或被忽略。
-# 检测方法：如果 iptables 输出包含 "iptables-legacy tables present" 警告，
-# 说明应该用 iptables-legacy 作为实际后端。
+# 检测方法：
+#   1) 先看 iptables 有没有 legacy 警告（快速路径）
+#   2) 如果没有警告，用默认 iptables 试写一条，检查是否真的写进去了
+#   3) 如果试写失败（静默失败），换 iptables-legacy 试
 _nopt_detect_ipt_backend() {
   local warn
+
+  # 快速路径：有 legacy 警告就直接返回 legacy
   if have_cmd iptables; then
     warn="$(iptables -t mangle -S POSTROUTING 2>&1 || true)"
     if echo "$warn" | grep -qi 'iptables-legacy'; then
@@ -788,9 +792,55 @@ _nopt_detect_ipt_backend() {
         return 0
       fi
     fi
+  fi
+
+  # 试写验证：用默认 iptables 写一条测试规则，检查是否真的存在
+  if have_cmd iptables; then
+    # 写入测试规则（用一个不太可能冲突的 MSS 值做标记）
+    iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+      -j TCPMSS --set-mss 9999 2>/dev/null || true
+
+    local test_cnt
+    test_cnt="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'set-mss 9999' || true)"
+    test_cnt="${test_cnt%%$'\n'*}"; test_cnt="${test_cnt:-0}"
+
+    # 清理测试规则（不管在哪个后端都清）
+    iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+      -j TCPMSS --set-mss 9999 2>/dev/null || true
+    if have_cmd iptables-legacy; then
+      iptables-legacy -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --set-mss 9999 2>/dev/null || true
+    fi
+
+    if [ "$test_cnt" -ge 1 ]; then
+      # 默认 iptables 能写能读，正常使用
+      echo "iptables"
+      return 0
+    fi
+
+    # 默认 iptables 试写失败（静默失败），尝试 iptables-legacy
+    if have_cmd iptables-legacy; then
+      iptables-legacy -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --set-mss 9999 2>/dev/null || true
+
+      test_cnt="$(iptables-legacy -t mangle -S POSTROUTING 2>/dev/null | grep -c 'set-mss 9999' || true)"
+      test_cnt="${test_cnt%%$'\n'*}"; test_cnt="${test_cnt:-0}"
+
+      # 清理
+      iptables-legacy -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --set-mss 9999 2>/dev/null || true
+
+      if [ "$test_cnt" -ge 1 ]; then
+        echo "iptables-legacy"
+        return 0
+      fi
+    fi
+
+    # 都写不进去，还是返回默认
     echo "iptables"
     return 0
   fi
+
   # fallback
   if have_cmd iptables-legacy; then
     echo "iptables-legacy"
@@ -1066,16 +1116,34 @@ if [ -f "$CONFIG_FILE" ]; then
     MSS="${MSS_VALUE:-1452}"
     IFACE="${CLAMP_IFACE:-}"
 
-    # 后端检测：优先用 config 记录的，否则自动检测
-    IPT="${IPT_BACKEND:-iptables}"
-    if ! command -v "$IPT" >/dev/null 2>&1; then
+    # 后端检测：优先用 config 记录的
+    IPT="${IPT_BACKEND:-}"
+    if [ -n "$IPT" ] && command -v "$IPT" >/dev/null 2>&1; then
+      : # config 中有记录且可用，直接使用
+    else
+      # 没有记录或不可用，用试写法检测
       IPT="iptables"
-    fi
-    # 二次校验：如果默认 iptables 有 legacy 警告，切换到 legacy
-    if [ "$IPT" = "iptables" ] && command -v iptables >/dev/null 2>&1; then
-      _warn="$(iptables -t mangle -S POSTROUTING 2>&1 || true)"
-      if echo "$_warn" | grep -qi 'iptables-legacy' && command -v iptables-legacy >/dev/null 2>&1; then
-        IPT="iptables-legacy"
+      if command -v iptables >/dev/null 2>&1; then
+        # 快速路径：legacy 警告
+        _warn="$(iptables -t mangle -S POSTROUTING 2>&1 || true)"
+        if echo "$_warn" | grep -qi 'iptables-legacy' && command -v iptables-legacy >/dev/null 2>&1; then
+          IPT="iptables-legacy"
+        else
+          # 试写验证
+          iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss 9999 2>/dev/null || true
+          _tc="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'set-mss 9999' || true)"
+          _tc="${_tc%%$'\n'*}"; _tc="${_tc:-0}"
+          iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss 9999 2>/dev/null || true
+          if command -v iptables-legacy >/dev/null 2>&1; then
+            iptables-legacy -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+              -j TCPMSS --set-mss 9999 2>/dev/null || true
+          fi
+          if [ "$_tc" -eq 0 ] && command -v iptables-legacy >/dev/null 2>&1; then
+            IPT="iptables-legacy"
+          fi
+        fi
       fi
     fi
 
