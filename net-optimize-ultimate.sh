@@ -1772,7 +1772,13 @@ if [ -f "$CONFIG_FILE" ]; then
     _dgw_clean="$(_strip_route_params "$_dgw")"
     ip route change $_dgw_clean initcwnd "$_cwnd" initrwnd "$_cwnd" 2>/dev/null || true
   fi
-  _dgw6="$(ip -6 route show default 2>/dev/null | head -n1 || true)"
+  # IPv6：RA 路由可能在开机后几秒才到达，等待最多 10 秒
+  _dgw6=""
+  for _wait in 1 2 3 4 5 6 7 8 9 10; do
+    _dgw6="$(ip -6 route show default 2>/dev/null | head -n1 || true)"
+    [ -n "$_dgw6" ] && break
+    sleep 1
+  done
   if [ -n "$_dgw6" ]; then
     _dgw6_clean="$(_strip_route_params "$_dgw6")"
     ip -6 route change $_dgw6_clean initcwnd "$_cwnd" initrwnd "$_cwnd" 2>/dev/null || true
@@ -1795,7 +1801,7 @@ Type=oneshot
 ExecStart=/usr/local/sbin/net-optimize-apply
 RemainAfterExit=yes
 StandardOutput=journal
-TimeoutSec=30
+TimeoutSec=45
 
 [Install]
 WantedBy=multi-user.target
