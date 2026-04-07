@@ -922,8 +922,14 @@ setup_dscp_marking() {
 
   echo "🏷️ QUIC/UDP DSCP 优先级标记..."
 
-  local ipt_backend
-  ipt_backend="$(_nopt_detect_ipt_backend)"
+  # 复用 MSS 阶段已检测并记录的后端，避免重复试写干扰
+  local ipt_backend=""
+  if [ -f "$CONFIG_FILE" ]; then
+    ipt_backend="$(grep '^IPT_BACKEND=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || true)"
+  fi
+  if [ -z "$ipt_backend" ] || ! have_cmd "$ipt_backend"; then
+    ipt_backend="$(_nopt_detect_ipt_backend)"
+  fi
   [ -z "$ipt_backend" ] && { echo "  ⚠️ iptables 不可用，跳过"; return 0; }
 
   local iface
@@ -1406,6 +1412,18 @@ EOF
     else
       echo "  ℹ️ ip6tables 不可用，跳过 IPv6 MSS"
     fi
+  fi
+
+  # === 最终完整性校验：确认 IPv4 TCPMSS 仍然存在 ===
+  local final_v4
+  final_v4="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+  final_v4="${final_v4%%$'\n'*}"; final_v4="${final_v4:-0}"
+  if [ "$final_v4" -eq 0 ]; then
+    echo "  ⚠️ IPv4 TCPMSS 在 IPv6 处理后消失，重新写入..."
+    _nopt_apply_one_tcpmss "$ipt_backend" "$iface" "$MSS_VALUE" || true
+    final_v4="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+    final_v4="${final_v4%%$'\n'*}"; final_v4="${final_v4:-0}"
+    [ "$final_v4" -ge 1 ] && echo "  ✅ IPv4 TCPMSS 已恢复" || echo "  ❌ IPv4 TCPMSS 恢复失败"
   fi
 }
 
