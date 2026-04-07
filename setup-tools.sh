@@ -1,4 +1,3 @@
-cat > setup-tools.sh <<'EOF'
 #!/bin/bash
 set -uo pipefail
 
@@ -17,7 +16,7 @@ fi
 APT="$SUDO apt-get"
 export DEBIAN_FRONTEND=noninteractive
 
-FAILED_PKGS=()
+declare -a FAILED_PKGS=()
 
 install_one() {
   local pkg="$1"
@@ -82,7 +81,17 @@ echo "🔹 安装系统排障/磁盘/性能工具..."
 install_if_missing \
   iotop ncdu tree bash-completion time logrotate \
   ethtool sysstat lsof unattended-upgrades \
-  p7zip-full xz-utils zstd openssl rclone fail2ban
+  p7zip-full xz-utils zstd openssl rclone fail2ban \
+  pv bc
+
+echo "🔹 安装时间同步服务..."
+if dpkg -s chrony >/dev/null 2>&1; then
+  echo "✅ chrony 已安装，跳过"
+else
+  install_if_missing chrony
+  $SUDO systemctl enable chrony >/dev/null 2>&1 || true
+  $SUDO systemctl start chrony >/dev/null 2>&1 || true
+fi
 
 echo "🔹 安装 dool/dstat（自动兼容）..."
 if apt-cache show dool >/dev/null 2>&1; then
@@ -150,7 +159,3 @@ if [ "${#FAILED_PKGS[@]}" -gt 0 ]; then
   echo "⚠️ 以下软件包安装失败（不影响脚本跑完）："
   printf '   - %s\n' "${FAILED_PKGS[@]}"
 fi
-EOF
-
-chmod +x setup-tools.sh
-./setup-tools.sh
