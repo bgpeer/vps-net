@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🔍 Net-Optimize 状态检测脚本 v1.4（配合 v3.6.0）
-# 新增：游戏 QoS 检测（cake/prio 方案 + AF41 DSCP 标记）
+# 🔍 Net-Optimize 状态检测脚本 v1.5（配合 v3.6.0）
+# 新增：自适应 QoS 守护进程检测
 # ==============================================================================
 set -euo pipefail
 
@@ -165,7 +165,45 @@ sep
 _qos_scheme="none"
 [[ -f /etc/net-optimize/config ]] && _qos_scheme="$(grep '^GAME_QOS_SCHEME=' /etc/net-optimize/config 2>/dev/null | cut -d= -f2 || echo "none")"
 
-if [[ "$_qos_scheme" == "cake" ]]; then
+# 检测自适应 QoS 状态
+_adaptive_active=0
+if systemctl is-active net-optimize-adaptive-qos >/dev/null 2>&1; then
+  _adaptive_active=1
+fi
+
+if [[ "$_adaptive_active" -eq 1 ]]; then
+  green "  🔄 自适应 QoS：运行中"
+  # 读取守护脚本中的阈值
+  _aq_threshold=""
+  _aq_interval=""
+  if [[ -f /usr/local/sbin/net-optimize-adaptive-qos ]]; then
+    _aq_threshold="$(grep '^THRESHOLD=' /usr/local/sbin/net-optimize-adaptive-qos 2>/dev/null | cut -d= -f2 | tr -d '"' || true)"
+    _aq_interval="$(grep '^INTERVAL=' /usr/local/sbin/net-optimize-adaptive-qos 2>/dev/null | cut -d= -f2 | tr -d '"' || true)"
+  fi
+  _aq_threshold="${_aq_threshold:-1048576}"
+  _aq_interval="${_aq_interval:-2}"
+  echo "    → 阈值: $(( _aq_threshold / 1024 )) KB/s  采样: ${_aq_interval}s"
+  echo "    → 流量 ≥ 阈值 → pfifo_fast（抢带宽）"
+  echo "    → 流量 < 阈值 → cake/prio（游戏低延迟）"
+
+  # 检测当前实际 qdisc 判断当前处于哪个模式
+  if [[ -n "$OUT_IFACE" ]] && has tc; then
+    _cur_qdisc="$(tc qdisc show dev "$OUT_IFACE" root 2>/dev/null | awk '{print $2}' | head -n1 || true)"
+    case "$_cur_qdisc" in
+      pfifo_fast|pfifo) yellow "    → 当前状态: ⚡ 抢带宽模式 (qdisc=$_cur_qdisc)" ;;
+      cake)             green  "    → 当前状态: 🎮 游戏低延迟模式 (cake)" ;;
+      prio)             green  "    → 当前状态: 🎮 游戏低延迟模式 (prio+fq_codel)" ;;
+      *)                echo   "    → 当前状态: qdisc=$_cur_qdisc" ;;
+    esac
+  fi
+
+  # 最近切换日志
+  _recent_switch="$(journalctl -t adaptive-qos --no-pager -n 3 --output=short-iso 2>/dev/null || true)"
+  if [[ -n "$_recent_switch" ]]; then
+    echo "    → 最近切换日志:"
+    echo "$_recent_switch" | sed 's/^/      /'
+  fi
+elif [[ "$_qos_scheme" == "cake" ]]; then
   green "  ✅ QoS 方案: cake diffserv4（4 档自动分流）"
   echo "    → Voice（游戏小包）> Video > Best Effort > Bulk（视频大流）"
   if [[ -n "$OUT_IFACE" ]] && has tc; then
@@ -188,7 +226,6 @@ elif [[ "$_qos_scheme" == "prio" ]]; then
       green "  ✅ prio qdisc 已生效"
       echo "  tc qdisc 详情:"
       tc qdisc show dev "$OUT_IFACE" 2>/dev/null | head -n8 || true
-      # 检查 tc filter
       _filter_cnt="$(tc filter show dev "$OUT_IFACE" parent 1: 2>/dev/null | grep -c 'filter' || true)"
       _filter_cnt="${_filter_cnt%%$'\n'*}"; _filter_cnt="${_filter_cnt:-0}"
       [[ "$_filter_cnt" -gt 0 ]] && green "  ✅ tc filter 规则: $_filter_cnt 条" || yellow "  ⚠️ tc filter 未发现"
@@ -357,7 +394,9 @@ sep
 echo "🛠 [10] 开机自启服务"
 sep
 svc_state "net-optimize.service"
+svc_state "net-optimize-adaptive-qos.service"
 [[ -x /usr/local/sbin/net-optimize-apply ]] && green "✅ apply 脚本存在" || yellow "⚠️ apply 脚本缺失"
+[[ -x /usr/local/sbin/net-optimize-adaptive-qos ]] && green "✅ adaptive-qos 守护脚本存在" || echo "  ℹ️ adaptive-qos 守护脚本未安装"
 [[ -f /etc/modules-load.d/conntrack.conf ]] && green "✅ conntrack 模块开机加载"
 
 # === [11] Nginx ===
