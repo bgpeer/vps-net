@@ -2495,6 +2495,8 @@ print_status() {
   echo ""
 }
 
+iface=$(ip -4 route get 1.1.1.1 | awk '/dev/{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}' | head -1) && iptables-legacy -t mangle -D POSTROUTING -o $iface -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1452 2>/dev/null; ip6tables-legacy -t mangle -D POSTROUTING -o $iface -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1432 2>/dev/null; echo "已删除 $iface 上的重复 TCPMSS"
+
 # === 14. 主流程 ===
 main() {
   require_root
