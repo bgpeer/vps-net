@@ -41,15 +41,10 @@ wget -O bbrplus.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/mast
 ## 🚀 一键执行网络优化配置
 ❗**网络优化之前请先装VPS适用工具，否则网络优化可能安装不成功**
 
-复制以下命令，在 VPS 上粘贴执行：
+**👉复制以下命令，在 VPS 上粘贴执行：**
 
-**👉普通模式**
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
-```
-**👉抢带宽模式**
-```bash
-AGGRESSIVE_MODE=1 bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
 ```
 
 ---
