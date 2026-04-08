@@ -1345,154 +1345,235 @@ setup_adaptive_qos() {
     ip6_cmd="ip6tables"
   fi
 
-  # === 写入守护脚本 ===
-  cat >"$ADAPTIVE_QOS_DAEMON" <<DAEMONEOF
-#!/usr/bin/env bash
-# net-optimize adaptive QoS daemon
-# 自动根据流量切换 抢带宽(pfifo_fast) ↔ 游戏低延迟(cake/prio)
-
-IFACE="${iface}"
-THRESHOLD="${ADAPTIVE_QOS_THRESHOLD}"   # bytes/sec
-INTERVAL="${ADAPTIVE_QOS_INTERVAL}"     # 采样间隔秒
-HAS_CAKE=${has_cake}
-IPT_BACKEND="${ipt_backend}"
-IP6_CMD="${ip6_cmd}"
-
-# 状态：game / aggressive / unknown
-CURRENT_MODE="unknown"
-
-# ---- 切换到游戏低延迟模式 ----
-switch_to_game() {
-  [ "\$CURRENT_MODE" = "game" ] && return 0
-
-  if [ "\$HAS_CAKE" = "1" ]; then
-    tc qdisc replace dev "\$IFACE" root cake bandwidth unlimited diffserv4 nat nowash no-split-gso 2>/dev/null || {
-      # fallback prio
-      _switch_prio
-      CURRENT_MODE="game"
-      return 0
-    }
-  else
-    _switch_prio
+  # === 检查 Python3 ===
+  if ! have_cmd python3; then
+    echo "  ⚠️ python3 不可用，跳过自适应 QoS"
+    return 0
   fi
 
-  # 游戏 DSCP 标记：UDP 小包(≤200B, 非443) → AF41
-  _apply_game_dscp
-
-  CURRENT_MODE="game"
-  logger -t adaptive-qos "切换 → 游戏低延迟 (rate < \${THRESHOLD}B/s)"
-}
-
-_switch_prio() {
-  tc qdisc replace dev "\$IFACE" root handle 1: prio bands 3 priomap \\
-    1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 2>/dev/null || return 0
-  tc qdisc replace dev "\$IFACE" parent 1:1 handle 10: fq_codel 2>/dev/null || true
-  tc qdisc replace dev "\$IFACE" parent 1:2 handle 20: fq_codel 2>/dev/null || true
-  tc qdisc replace dev "\$IFACE" parent 1:3 handle 30: fq_codel 2>/dev/null || true
-  tc filter del dev "\$IFACE" parent 1: 2>/dev/null || true
-  tc filter add dev "\$IFACE" parent 1: protocol ip prio 1 u32 \\
-    match ip tos 0xb8 0xfc flowid 1:1 2>/dev/null || true
-  tc filter add dev "\$IFACE" parent 1: protocol ip prio 2 u32 \\
-    match ip tos 0x88 0xfc flowid 1:1 2>/dev/null || true
-  tc filter add dev "\$IFACE" parent 1: protocol ip prio 3 u32 \\
-    match ip protocol 17 0xff match u16 0x0000 0xff80 at 2 flowid 1:1 2>/dev/null || true
-}
-
-_apply_game_dscp() {
-  [ -z "\$IPT_BACKEND" ] && return 0
-  command -v "\$IPT_BACKEND" >/dev/null 2>&1 || return 0
-  local _opts="-p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41"
-  # 先清旧
-  for _cmd in "\$IPT_BACKEND" \${IP6_CMD:+"\$IP6_CMD"}; do
-    [ -n "\$_cmd" ] && command -v "\$_cmd" >/dev/null 2>&1 || continue
-    local _rules
-    _rules="\$("\$_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
-    while IFS= read -r rule; do
-      [ -z "\$rule" ] && continue
-      local del="\${rule/-A POSTROUTING/-D POSTROUTING}"
-      read -r -a parts <<<"\$del"
-      "\$_cmd" -t mangle "\${parts[@]}" 2>/dev/null || true
-    done <<<"\$_rules"
-  done
-  # 写入
-  "\$IPT_BACKEND" -t mangle -A POSTROUTING -o "\$IFACE" \$_opts 2>/dev/null || true
-  if [ -n "\$IP6_CMD" ] && command -v "\$IP6_CMD" >/dev/null 2>&1; then
-    "\$IP6_CMD" -t mangle -A POSTROUTING -o "\$IFACE" \$_opts 2>/dev/null || true
+  # === 检测 -m length 模块可用性 ===
+  local has_length=0
+  if [ -n "$ipt_backend" ] && have_cmd "$ipt_backend"; then
+    if "$ipt_backend" -t mangle -A POSTROUTING -p udp -m length --length 0:200 -j RETURN 2>/dev/null; then
+      "$ipt_backend" -t mangle -D POSTROUTING -p udp -m length --length 0:200 -j RETURN 2>/dev/null || true
+      has_length=1
+    fi
   fi
+  [ "$has_length" = "0" ] && echo "  ⚠️ iptables -m length 不可用，AF41 标记将跳过"
+
+  # === 写入 JSON 配置 ===
+  cat >"$CONFIG_DIR/adaptive-qos.conf" <<CONFEOF
+{
+  "iface": "$iface",
+  "threshold": $ADAPTIVE_QOS_THRESHOLD,
+  "interval": $ADAPTIVE_QOS_INTERVAL,
+  "has_cake": $([ "$has_cake" = "1" ] && echo "true" || echo "false"),
+  "has_length": $([ "$has_length" = "1" ] && echo "true" || echo "false"),
+  "ipt_backend": "$ipt_backend",
+  "ip6_cmd": "$ip6_cmd"
 }
+CONFEOF
 
-_clear_game_dscp() {
-  [ -z "\$IPT_BACKEND" ] && return 0
-  command -v "\$IPT_BACKEND" >/dev/null 2>&1 || return 0
-  for _cmd in "\$IPT_BACKEND" \${IP6_CMD:+"\$IP6_CMD"}; do
-    [ -n "\$_cmd" ] && command -v "\$_cmd" >/dev/null 2>&1 || continue
-    local _rules
-    _rules="\$("\$_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
-    while IFS= read -r rule; do
-      [ -z "\$rule" ] && continue
-      local del="\${rule/-A POSTROUTING/-D POSTROUTING}"
-      read -r -a parts <<<"\$del"
-      "\$_cmd" -t mangle "\${parts[@]}" 2>/dev/null || true
-    done <<<"\$_rules"
-  done
-}
+  # === 写入 Python3 守护脚本 ===
+  cat >"$ADAPTIVE_QOS_DAEMON" <<'PYEOF'
+#!/usr/bin/env python3
+"""net-optimize adaptive QoS daemon
+自动根据出口流量切换 抢带宽(pfifo_fast) ↔ 游戏低延迟(cake/prio)
+"""
 
-# ---- 切换到抢带宽模式 ----
-switch_to_aggressive() {
-  [ "\$CURRENT_MODE" = "aggressive" ] && return 0
+import json
+import logging
+import logging.handlers
+import os
+import shutil
+import subprocess
+import sys
+import time
 
-  tc qdisc replace dev "\$IFACE" root pfifo_fast 2>/dev/null || \\
-    tc qdisc replace dev "\$IFACE" root pfifo limit 10000 2>/dev/null || true
+CONF_PATH = "/etc/net-optimize/adaptive-qos.conf"
 
-  # 清除游戏 DSCP 标记
-  _clear_game_dscp
+# ---------------------------------------------------------------------------
+# Logging → syslog (tag: adaptive-qos)
+# ---------------------------------------------------------------------------
+log = logging.getLogger("adaptive-qos")
+log.setLevel(logging.INFO)
+try:
+    _h = logging.handlers.SysLogHandler(address="/dev/log")
+    _h.ident = "adaptive-qos: "
+    log.addHandler(_h)
+except Exception:
+    logging.basicConfig(level=logging.INFO)
 
-  CURRENT_MODE="aggressive"
-  logger -t adaptive-qos "切换 → 抢带宽 (rate >= \${THRESHOLD}B/s)"
-}
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def run(cmd: str, check: bool = False) -> subprocess.CompletedProcess:
+    """Run a shell command; never raise unless check=True."""
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, check=check)
 
-# ---- 主循环 ----
-# 启动时先进入游戏模式
-switch_to_game
+def has_cmd(name: str) -> bool:
+    return shutil.which(name) is not None
 
-prev_tx=0
-first=1
+def read_tx_bytes(iface: str) -> int:
+    try:
+        with open(f"/sys/class/net/{iface}/statistics/tx_bytes") as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
 
-while true; do
-  tx=\$(cat /sys/class/net/"\$IFACE"/statistics/tx_bytes 2>/dev/null || echo 0)
+# ---------------------------------------------------------------------------
+# Load config
+# ---------------------------------------------------------------------------
+def load_conf() -> dict:
+    with open(CONF_PATH) as f:
+        return json.load(f)
 
-  if [ "\$first" = "1" ]; then
-    prev_tx=\$tx
-    first=0
-    sleep "\$INTERVAL"
-    continue
-  fi
+# ---------------------------------------------------------------------------
+# QoS switching
+# ---------------------------------------------------------------------------
+class AdaptiveQoS:
+    def __init__(self, conf: dict):
+        self.iface      = conf["iface"]
+        self.threshold  = conf["threshold"]
+        self.interval   = conf["interval"]
+        self.has_cake   = conf.get("has_cake", False)
+        self.has_length = conf.get("has_length", False)
+        self.ipt        = conf.get("ipt_backend", "")
+        self.ip6        = conf.get("ip6_cmd", "")
+        self.mode       = "unknown"  # game / aggressive / unknown
 
-  rate=\$(( (tx - prev_tx) / INTERVAL ))
-  prev_tx=\$tx
+    # ---- tc: 游戏低延迟 ----
+    def _apply_cake(self) -> bool:
+        r = run(f"tc qdisc replace dev {self.iface} root cake bandwidth unlimited "
+                f"diffserv4 nat nowash no-split-gso")
+        return r.returncode == 0
 
-  if [ "\$rate" -ge "\$THRESHOLD" ]; then
-    switch_to_aggressive
-  else
-    switch_to_game
-  fi
+    def _apply_prio(self):
+        run(f"tc qdisc replace dev {self.iface} root handle 1: prio bands 3 "
+            f"priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1")
+        run(f"tc qdisc replace dev {self.iface} parent 1:1 handle 10: fq_codel")
+        run(f"tc qdisc replace dev {self.iface} parent 1:2 handle 20: fq_codel")
+        run(f"tc qdisc replace dev {self.iface} parent 1:3 handle 30: fq_codel")
+        run(f"tc filter del dev {self.iface} parent 1:")
+        # DSCP EF → band 0
+        run(f"tc filter add dev {self.iface} parent 1: protocol ip prio 1 u32 "
+            f"match ip tos 0xb8 0xfc flowid 1:1")
+        # DSCP AF41 → band 0
+        run(f"tc filter add dev {self.iface} parent 1: protocol ip prio 2 u32 "
+            f"match ip tos 0x88 0xfc flowid 1:1")
+        # 小 UDP 包 → band 0
+        run(f"tc filter add dev {self.iface} parent 1: protocol ip prio 3 u32 "
+            f"match ip protocol 17 0xff match u16 0x0000 0xff80 at 2 flowid 1:1")
 
-  sleep "\$INTERVAL"
-done
-DAEMONEOF
+    # ---- tc: 抢带宽 ----
+    def _apply_pfifo(self):
+        r = run(f"tc qdisc replace dev {self.iface} root pfifo_fast")
+        if r.returncode != 0:
+            run(f"tc qdisc replace dev {self.iface} root pfifo limit 10000")
+
+    # ---- DSCP AF41: 游戏小包标记 ----
+    def _clear_af41(self):
+        """清除所有 AF41 (0x22) DSCP 规则"""
+        for cmd in [self.ipt, self.ip6]:
+            if not cmd or not has_cmd(cmd):
+                continue
+            r = run(f"{cmd} -t mangle -S POSTROUTING")
+            if r.returncode != 0:
+                continue
+            for line in r.stdout.splitlines():
+                if "0x22" not in line:
+                    continue
+                del_rule = line.replace("-A POSTROUTING", "-D POSTROUTING", 1)
+                run(f"{cmd} -t mangle {del_rule}")
+
+    def _apply_af41(self):
+        """写入 AF41 DSCP: UDP ≤200B 非443 端口"""
+        if not self.has_length:
+            return
+        self._clear_af41()
+        opts = ("-p udp ! --dport 443 -m length --length 0:200 "
+                "-j DSCP --set-dscp-class AF41")
+        if self.ipt and has_cmd(self.ipt):
+            run(f"{self.ipt} -t mangle -A POSTROUTING -o {self.iface} {opts}")
+        if self.ip6 and has_cmd(self.ip6):
+            run(f"{self.ip6} -t mangle -A POSTROUTING -o {self.iface} {opts}")
+
+    # ---- 模式切换 ----
+    def switch_to_game(self):
+        if self.mode == "game":
+            return
+        if self.has_cake:
+            if not self._apply_cake():
+                self._apply_prio()
+        else:
+            self._apply_prio()
+        self._apply_af41()
+        self.mode = "game"
+        log.info("切换 → 游戏低延迟 (rate < %d B/s)", self.threshold)
+
+    def switch_to_aggressive(self):
+        if self.mode == "aggressive":
+            return
+        self._apply_pfifo()
+        self._clear_af41()
+        self.mode = "aggressive"
+        log.info("切换 → 抢带宽 (rate >= %d B/s)", self.threshold)
+
+    # ---- 主循环 ----
+    def run_forever(self):
+        log.info("启动: iface=%s threshold=%d interval=%d",
+                 self.iface, self.threshold, self.interval)
+
+        # 启动时先进入游戏模式
+        self.switch_to_game()
+
+        prev_tx = read_tx_bytes(self.iface)
+        time.sleep(self.interval)
+
+        while True:
+            tx = read_tx_bytes(self.iface)
+            rate = (tx - prev_tx) // self.interval
+            prev_tx = tx
+
+            if rate >= self.threshold:
+                self.switch_to_aggressive()
+            else:
+                self.switch_to_game()
+
+            time.sleep(self.interval)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        conf = load_conf()
+    except Exception as e:
+        print(f"❌ 读取配置失败: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    qos = AdaptiveQoS(conf)
+    try:
+        qos.run_forever()
+    except KeyboardInterrupt:
+        log.info("收到停止信号，退出")
+    except Exception as e:
+        log.error("守护进程异常: %s", e)
+        sys.exit(1)
+PYEOF
 
   chmod +x "$ADAPTIVE_QOS_DAEMON"
 
   # === 安装 systemd 服务 ===
   cat >"/etc/systemd/system/${ADAPTIVE_QOS_SERVICE}.service" <<SVCEOF
 [Unit]
-Description=Net-Optimize Adaptive QoS Daemon
+Description=Net-Optimize Adaptive QoS Daemon (Python3)
 After=network-online.target net-optimize.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${ADAPTIVE_QOS_DAEMON}
+ExecStart=/usr/bin/python3 ${ADAPTIVE_QOS_DAEMON}
 Restart=always
 RestartSec=5
 
