@@ -2039,6 +2039,12 @@ install_boot_service() {
 #!/usr/bin/env bash
 # 开机恢复脚本：不使用 set -e，确保所有步骤都能执行到
 
+# 调试日志
+LOG="/var/log/net-optimize-apply.log"
+exec >> "$LOG" 2>&1
+echo "=== $(date) === boot apply start ==="
+set -x
+
 MODULES_FILE="/etc/net-optimize/modules.list"
 if [ -f "$MODULES_FILE" ]; then
   while IFS= read -r module; do
