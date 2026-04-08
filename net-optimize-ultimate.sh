@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.5.0
+# 🚀 Net-Optimize-Ultimate v3.6.0
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
+# v3.6.0 新增：
+#   1) 游戏低延迟 QoS（cake diffserv4 优先，fallback prio+fq_codel）
+#   2) 游戏 DSCP 标记（UDP 小包 ≤200B 非 443 → AF41 低延迟档）
+#   3) cake 4 档自动分流：大流→Bulk 小包→Voice，视频游戏兼容
+#   4) prio fallback：3 band + tc filter 按 DSCP/包大小分流
 # v3.5.0 新增：
 #   1) 网卡 offload 优化（GRO/GSO/TSO 自动开启）
 #   2) RPS/RFS 多核收包均衡（自动检测 CPU 核数）
@@ -90,7 +95,7 @@ install -Dm755 "$0" "$SCRIPT_PATH" 2>/dev/null || true
 
 trap 'code=$?; echo "❌ 出错：第 ${BASH_LINENO[0]} 行 -> ${BASH_COMMAND} (退出码 $code)"; exit $code' ERR
 
-echo "🚀 Net-Optimize-Ultimate v3.5.0 开始执行..."
+echo "🚀 Net-Optimize-Ultimate v3.6.0 开始执行..."
 echo "========================================================"
 
 # === 2. 全局配置开关 ===
@@ -111,6 +116,7 @@ echo "========================================================"
 : "${ENABLE_INITCWND:=1}"       # 自动检测线路质量调整 initcwnd
 : "${TCP_NOTSENT_LOWAT:=4096}"  # 代理场景低延迟（默认 4096，原 16384）
 : "${AGGRESSIVE_MODE:=0}"      # 激进模式：抢带宽（类似 Hy2 暴力发包思路）
+: "${ENABLE_GAME_QOS:=1}"      # 游戏低延迟 QoS（cake/prio 双方案自动选择）
 
 # 路径定义
 CONFIG_DIR="/etc/net-optimize"
@@ -572,7 +578,7 @@ write_sysctl_conf() {
 
   {
     echo "# ========================================================="
-    echo "# 🚀 Net-Optimize Ultimate v3.5.0 - Kernel Parameters"
+    echo "# 🚀 Net-Optimize Ultimate v3.6.0 - Kernel Parameters"
     echo "# Generated: $(date -u '+%F %T UTC')"
     echo "# ========================================================="
     echo
@@ -1135,6 +1141,147 @@ setup_aggressive_tc() {
   current_qdisc="$(tc qdisc show dev "$iface" root 2>/dev/null | awk '{print $2}' | head -n1 || true)"
   echo "  ✅ $iface qdisc 已设置为: ${current_qdisc:-unknown}"
   echo "  ⚡ 无流量整形，发包不受 AQM 限制"
+}
+
+# === 9.10 游戏低延迟 QoS（cake + prio 双方案）===
+setup_game_qos() {
+  if [ "${ENABLE_GAME_QOS:-1}" != "1" ]; then
+    echo "⏭️ 跳过游戏 QoS 配置"
+    return 0
+  fi
+
+  # 激进模式与游戏 QoS 互斥（激进模式用 pfifo_fast 不做调度）
+  if [ "${AGGRESSIVE_MODE:-0}" = "1" ]; then
+    echo "⏭️ 激进模式已开启，跳过游戏 QoS（互斥）"
+    return 0
+  fi
+
+  echo "🎮 游戏低延迟 QoS 配置..."
+
+  have_cmd tc || { echo "  ⚠️ tc 命令不可用，跳过"; return 0; }
+
+  local iface
+  iface="$(detect_outbound_iface 2>/dev/null || true)"
+  [ -z "$iface" ] && { echo "  ⚠️ 无法检测出口网卡，跳过"; return 0; }
+
+  # --- 检测 iptables 后端（复用已保存的）---
+  local ipt_backend=""
+  if [ -f "$CONFIG_FILE" ]; then
+    ipt_backend="$(grep '^IPT_BACKEND=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || true)"
+  fi
+  if [ -z "$ipt_backend" ] || ! have_cmd "$ipt_backend"; then
+    ipt_backend="$(_nopt_detect_ipt_backend)"
+  fi
+
+  # --- 检测 IPv6 后端 ---
+  local ip6_cmd=""
+  if [ "$ipt_backend" = "iptables-legacy" ] && have_cmd ip6tables-legacy; then
+    ip6_cmd="ip6tables-legacy"
+  elif have_cmd ip6tables; then
+    ip6_cmd="ip6tables"
+  fi
+
+  # === 方案选择：优先 cake，fallback prio ===
+  local qos_scheme="none"
+
+  # 检测 cake 是否可用
+  if modprobe sch_cake 2>/dev/null; then
+    # 试挂 cake，如果成功就用 cake
+    if tc qdisc replace dev "$iface" root cake bandwidth unlimited diffserv4 nat nowash no-split-gso 2>/dev/null; then
+      qos_scheme="cake"
+      echo "  ✅ 方案 A：cake diffserv4 已启用"
+      echo "    → 4 档优先级自动分流（Bulk/Best Effort/Video/Voice）"
+      echo "    → 游戏小包自动归入高优先级队列"
+      echo "    → 视频大流归入 Bulk 队列，不挤压游戏包"
+    else
+      echo "  ⚠️ cake 挂载失败，回退方案 B"
+    fi
+  fi
+
+  # cake 不可用，用 prio + fq_codel 分流
+  if [ "$qos_scheme" = "none" ]; then
+    # prio 3 档：band 0（高优先）/ band 1（普通）/ band 2（低优先）
+    # 每个 band 下挂 fq_codel 做 per-flow 公平调度
+    tc qdisc replace dev "$iface" root handle 1: prio bands 3 priomap \
+      1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 2>/dev/null || {
+      echo "  ⚠️ prio qdisc 设置失败，跳过游戏 QoS"
+      return 0
+    }
+
+    # 每个 band 挂 fq_codel
+    tc qdisc replace dev "$iface" parent 1:1 handle 10: fq_codel 2>/dev/null || true
+    tc qdisc replace dev "$iface" parent 1:2 handle 20: fq_codel 2>/dev/null || true
+    tc qdisc replace dev "$iface" parent 1:3 handle 30: fq_codel 2>/dev/null || true
+
+    # tc filter：DSCP EF(46) / AF41(34) → band 0（高优先）
+    # 先清旧 filter
+    tc filter del dev "$iface" parent 1: 2>/dev/null || true
+    # DSCP EF (TOS 0xb8) → band 0
+    tc filter add dev "$iface" parent 1: protocol ip prio 1 u32 \
+      match ip tos 0xb8 0xfc flowid 1:1 2>/dev/null || true
+    # DSCP AF41 (TOS 0x88) → band 0
+    tc filter add dev "$iface" parent 1: protocol ip prio 2 u32 \
+      match ip tos 0x88 0xfc flowid 1:1 2>/dev/null || true
+    # 小 UDP 包 (≤128 字节) → band 0（游戏包通常很小）
+    tc filter add dev "$iface" parent 1: protocol ip prio 3 u32 \
+      match ip protocol 17 0xff match u16 0x0000 0xff80 at 2 flowid 1:1 2>/dev/null || true
+
+    qos_scheme="prio"
+    echo "  ✅ 方案 B：prio + fq_codel 已启用"
+    echo "    → band 0（高优先）：DSCP EF/AF41 + 小 UDP 包"
+    echo "    → band 1（普通）：一般流量"
+    echo "    → band 2（低优先）：Bulk 流量"
+  fi
+
+  # === DSCP 标记：游戏流量打 AF41 ===
+  # 游戏特征：小 UDP 包（≤128 字节，排除 QUIC 443 已经打了 EF）
+  # 这里标记 UDP 非 443 端口的小包为 AF41
+  if [ -n "$ipt_backend" ] && have_cmd "$ipt_backend"; then
+    # 清理旧的 AF41 规则
+    local _af41_rules
+    for _cmd in "$ipt_backend" ${ip6_cmd:+"$ip6_cmd"}; do
+      [ -n "$_cmd" ] && have_cmd "$_cmd" || continue
+      _af41_rules="$("$_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
+      if [ -n "$_af41_rules" ]; then
+        while IFS= read -r rule; do
+          [ -z "$rule" ] && continue
+          local del="${rule/-A POSTROUTING/-D POSTROUTING}"
+          local -a parts
+          read -r -a parts <<<"$del"
+          "$_cmd" -t mangle "${parts[@]}" 2>/dev/null || true
+        done <<<"$_af41_rules"
+      fi
+    done
+
+    # 写入新规则：UDP 小包（≤128 字节）且非 443 端口 → AF41
+    # -m length 匹配 IP 总长度（含头），UDP 游戏包通常 <200 字节
+    local _game_dscp_opts="-p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41"
+    if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
+      "$ipt_backend" -t mangle -A POSTROUTING -o "$iface" $_game_dscp_opts 2>/dev/null || true
+    else
+      "$ipt_backend" -t mangle -A POSTROUTING $_game_dscp_opts 2>/dev/null || true
+    fi
+
+    # IPv6 同样处理
+    if [ -n "$ip6_cmd" ]; then
+      if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
+        "$ip6_cmd" -t mangle -A POSTROUTING -o "$iface" $_game_dscp_opts 2>/dev/null || true
+      else
+        "$ip6_cmd" -t mangle -A POSTROUTING $_game_dscp_opts 2>/dev/null || true
+      fi
+    fi
+
+    echo "  ✅ 游戏 DSCP 标记：UDP 小包(≤200B, 非443) → AF41"
+  fi
+
+  # 持久化到 config
+  if [ -f "$CONFIG_FILE" ]; then
+    grep -q '^GAME_QOS_SCHEME=' "$CONFIG_FILE" 2>/dev/null \
+      && sed -i "s/^GAME_QOS_SCHEME=.*/GAME_QOS_SCHEME=$qos_scheme/" "$CONFIG_FILE" \
+      || echo "GAME_QOS_SCHEME=$qos_scheme" >> "$CONFIG_FILE"
+  fi
+
+  echo "  ✅ 游戏 QoS 配置完成（方案: $qos_scheme）"
 }
 
 # === 10. MSS Clamping ===
@@ -1785,7 +1932,79 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 fi
 
-echo "[$(date)] Net-Optimize v3.5.0 开机优化完成"
+# === 游戏 QoS 恢复（cake / prio 双方案）===
+if [ -f "$CONFIG_FILE" ]; then
+  . "$CONFIG_FILE"
+  _qos_scheme="${GAME_QOS_SCHEME:-none}"
+  IFACE="${CLAMP_IFACE:-}"
+
+  if [ "$_qos_scheme" = "cake" ]; then
+    modprobe sch_cake 2>/dev/null || true
+    if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+      tc qdisc replace dev "$IFACE" root cake bandwidth unlimited diffserv4 nat nowash no-split-gso 2>/dev/null || true
+    fi
+  elif [ "$_qos_scheme" = "prio" ]; then
+    if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+      tc qdisc replace dev "$IFACE" root handle 1: prio bands 3 priomap \
+        1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 2>/dev/null || true
+      tc qdisc replace dev "$IFACE" parent 1:1 handle 10: fq_codel 2>/dev/null || true
+      tc qdisc replace dev "$IFACE" parent 1:2 handle 20: fq_codel 2>/dev/null || true
+      tc qdisc replace dev "$IFACE" parent 1:3 handle 30: fq_codel 2>/dev/null || true
+      tc filter del dev "$IFACE" parent 1: 2>/dev/null || true
+      tc filter add dev "$IFACE" parent 1: protocol ip prio 1 u32 \
+        match ip tos 0xb8 0xfc flowid 1:1 2>/dev/null || true
+      tc filter add dev "$IFACE" parent 1: protocol ip prio 2 u32 \
+        match ip tos 0x88 0xfc flowid 1:1 2>/dev/null || true
+      tc filter add dev "$IFACE" parent 1: protocol ip prio 3 u32 \
+        match ip protocol 17 0xff match u16 0x0000 0xff80 at 2 flowid 1:1 2>/dev/null || true
+    fi
+  fi
+
+  # 恢复游戏 DSCP 标记（AF41 = UDP 小包非 443）
+  if [ "$_qos_scheme" != "none" ]; then
+    IPT="${IPT_BACKEND:-iptables}"
+    command -v "$IPT" >/dev/null 2>&1 || IPT="iptables"
+
+    IP6_CMD=""
+    if [ "$IPT" = "iptables-legacy" ] && command -v ip6tables-legacy >/dev/null 2>&1; then
+      IP6_CMD="ip6tables-legacy"
+    elif command -v ip6tables >/dev/null 2>&1; then
+      IP6_CMD="ip6tables"
+    fi
+
+    _game_dscp="-p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41"
+
+    if command -v "$IPT" >/dev/null 2>&1; then
+      # 清理旧 AF41
+      "$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' | while IFS= read -r rule; do
+        del="${rule/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a parts <<<"$del"
+        "$IPT" -t mangle "${parts[@]}" 2>/dev/null || true
+      done || true
+      # 写入
+      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+        "$IPT" -t mangle -A POSTROUTING -o "$IFACE" $_game_dscp 2>/dev/null || true
+      else
+        "$IPT" -t mangle -A POSTROUTING $_game_dscp 2>/dev/null || true
+      fi
+    fi
+
+    if [ -n "$IP6_CMD" ]; then
+      "$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' | while IFS= read -r rule; do
+        del="${rule/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a parts <<<"$del"
+        "$IP6_CMD" -t mangle "${parts[@]}" 2>/dev/null || true
+      done || true
+      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+        "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" $_game_dscp 2>/dev/null || true
+      else
+        "$IP6_CMD" -t mangle -A POSTROUTING $_game_dscp 2>/dev/null || true
+      fi
+    fi
+  fi
+fi
+
+echo "[$(date)] Net-Optimize v3.6.0 开机优化完成"
 APPLYEOF
 
   chmod +x "$APPLY_SCRIPT"
@@ -1886,6 +2105,48 @@ print_status() {
   fi
   echo ""
 
+  printf "🎮 游戏 QoS 状态:\n"
+  local _qos_scheme_status="none"
+  if [ -f "$CONFIG_FILE" ]; then
+    _qos_scheme_status="$(grep '^GAME_QOS_SCHEME=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "none")"
+  fi
+  if [ "$_qos_scheme_status" = "cake" ]; then
+    printf "  ✅ 方案: cake diffserv4（4 档自动分流）\n"
+    local _cake_iface
+    _cake_iface="$(detect_outbound_iface 2>/dev/null || true)"
+    if [ -n "$_cake_iface" ]; then
+      tc -s qdisc show dev "$_cake_iface" 2>/dev/null | head -n5 || true
+    fi
+  elif [ "$_qos_scheme_status" = "prio" ]; then
+    printf "  ✅ 方案: prio + fq_codel（3 档手动分流）\n"
+    local _prio_iface
+    _prio_iface="$(detect_outbound_iface 2>/dev/null || true)"
+    if [ -n "$_prio_iface" ]; then
+      printf "  tc qdisc:\n"
+      tc qdisc show dev "$_prio_iface" 2>/dev/null | head -n8 || true
+    fi
+  else
+    printf "  ℹ️ 未启用（AGGRESSIVE_MODE=1 或 ENABLE_GAME_QOS=0）\n"
+  fi
+
+  # DSCP 规则概览
+  local _dscp_v4_cnt=0 _dscp_v6_cnt=0
+  for _ds_cmd in iptables iptables-legacy iptables-nft; do
+    have_cmd "$_ds_cmd" || continue
+    _dscp_v4_cnt="$("$_ds_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP' || true)"
+    _dscp_v4_cnt="${_dscp_v4_cnt%%$'\n'*}"
+    [ "${_dscp_v4_cnt:-0}" -gt 0 ] && break
+  done
+  for _ds6_cmd in ip6tables ip6tables-legacy; do
+    have_cmd "$_ds6_cmd" || continue
+    _dscp_v6_cnt="$("$_ds6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP' || true)"
+    _dscp_v6_cnt="${_dscp_v6_cnt%%$'\n'*}"
+    [ "${_dscp_v6_cnt:-0}" -gt 0 ] && break
+  done
+  printf "  DSCP 规则: IPv4=%s条 IPv6=%s条 (EF=QUIC加速, AF41=游戏小包)\n" \
+    "${_dscp_v4_cnt:-0}" "${_dscp_v6_cnt:-0}"
+  echo ""
+
   printf "📡 MSS Clamping 规则:\n"
   local _ps_found=0
   for _ps_cmd in iptables iptables-legacy iptables-nft; do
@@ -1916,7 +2177,7 @@ print_status() {
 main() {
   require_root
 
-  echo "🚀 Net-Optimize-Ultimate v3.5.0 启动..."
+  echo "🚀 Net-Optimize-Ultimate v3.6.0 启动..."
   echo "========================================================"
 
   clean_old_config
@@ -1933,6 +2194,7 @@ main() {
   setup_dscp_marking
   setup_initcwnd
   setup_aggressive_tc
+  setup_game_qos
   fix_nginx_repo
   install_boot_service
 
