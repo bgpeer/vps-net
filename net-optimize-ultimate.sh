@@ -2112,9 +2112,9 @@ if [ -f "$CONFIG_FILE" ]; then
       modprobe ip6_tables 2>/dev/null || true
       modprobe ip6table_mangle 2>/dev/null || true
 
-      # IPv4 TCPMSS：幂等写入（-C 检查存在则跳过）
-      "$IPT" -t mangle -C POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
-        -j TCPMSS --set-mss "$MSS" 2>/dev/null || \
+      # IPv4 TCPMSS：删光旧的 → 写 1 条
+      while "$IPT" -t mangle -D POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --set-mss "$MSS" 2>/dev/null; do :; done
       "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
         -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
     fi
@@ -2137,9 +2137,9 @@ if [ -f "$CONFIG_FILE" ]; then
     fi
 
     if [ -n "$IP6_CMD" ]; then
-      # IPv6 TCPMSS：幂等写入
-      "$IP6_CMD" -t mangle -C POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
-        -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null || \
+      # IPv6 TCPMSS：删光旧的 → 写 1 条
+      while "$IP6_CMD" -t mangle -D POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null; do :; done
       "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
         -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null || true
     fi
@@ -2162,15 +2162,15 @@ if [ -f "$CONFIG_FILE" ]; then
 
   _dscp_opts="-p udp --dport 443 -j DSCP --set-dscp-class EF"
 
-  # --- IPv4 EF：幂等写入 ---
+  # --- IPv4 EF：删光所有旧的 → 写 1 条 ---
   if command -v "$IPT" >/dev/null 2>&1; then
-    "$IPT" -t mangle -C POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || \
+    while "$IPT" -t mangle -D POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null; do :; done
     "$IPT" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
   fi
 
-  # --- IPv6 EF：幂等写入 ---
+  # --- IPv6 EF：删光所有旧的 → 写 1 条 ---
   if [ -n "$IP6_CMD" ] && command -v "$IP6_CMD" >/dev/null 2>&1; then
-    "$IP6_CMD" -t mangle -C POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || \
+    while "$IP6_CMD" -t mangle -D POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null; do :; done
     "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
   fi
 fi
