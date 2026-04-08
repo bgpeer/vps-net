@@ -2115,6 +2115,8 @@ if [ -f "$CONFIG_FILE" ]; then
     if command -v "$IPT" >/dev/null 2>&1; then
       modprobe ip_tables 2>/dev/null || true
       modprobe iptable_mangle 2>/dev/null || true
+      modprobe ip6_tables 2>/dev/null || true
+      modprobe ip6table_mangle 2>/dev/null || true
 
       # 清理所有旧 TCPMSS（所有可用后端都清，防止共享表残留）
       for _clean_cmd in iptables iptables-nft iptables-legacy; do
