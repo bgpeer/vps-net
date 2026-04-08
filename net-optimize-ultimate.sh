@@ -2037,7 +2037,7 @@ install_boot_service() {
 
   cat >"$APPLY_SCRIPT" <<'APPLYEOF'
 #!/usr/bin/env bash
-set -euo pipefail
+# 开机恢复脚本：不使用 set -e，确保所有步骤都能执行到
 
 MODULES_FILE="/etc/net-optimize/modules.list"
 if [ -f "$MODULES_FILE" ]; then
