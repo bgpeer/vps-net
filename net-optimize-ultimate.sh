@@ -2162,15 +2162,15 @@ if [ -f "$CONFIG_FILE" ]; then
 
   _dscp_opts="-p udp --dport 443 -j DSCP --set-dscp-class EF"
 
-  # --- IPv4 EF：删光重复 → 写 1 条 ---
+  # --- IPv4 EF：幂等写入 ---
   if command -v "$IPT" >/dev/null 2>&1; then
-    while "$IPT" -t mangle -D POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null; do :; done
+    "$IPT" -t mangle -C POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || \
     "$IPT" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
   fi
 
-  # --- IPv6 EF：删光重复 → 写 1 条 ---
+  # --- IPv6 EF：幂等写入 ---
   if [ -n "$IP6_CMD" ] && command -v "$IP6_CMD" >/dev/null 2>&1; then
-    while "$IP6_CMD" -t mangle -D POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null; do :; done
+    "$IP6_CMD" -t mangle -C POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || \
     "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
   fi
 fi
@@ -2494,9 +2494,6 @@ print_status() {
   echo "========================================================="
   echo ""
 }
-
-#手动清除TCPMSS
-iface=$(ip -4 route get 1.1.1.1 | awk '/dev/{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}' | head -1) && iptables-legacy -t mangle -D POSTROUTING -o $iface -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1452 2>/dev/null; ip6tables-legacy -t mangle -D POSTROUTING -o $iface -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1432 2>/dev/null; echo "已删除 $iface 上的重复 TCPMSS"
 
 # === 14. 主流程 ===
 main() {
