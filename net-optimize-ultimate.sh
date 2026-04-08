@@ -173,11 +173,18 @@ check_dpkg_clean() {
   broken_pkgs="$(dpkg --audit 2>/dev/null || true)"
   [ -z "$broken_pkgs" ] && { echo "✅ dpkg 自动修复完成"; return 0; }
 
-  # 第二轮：提取卡住的包名，逐个强制移除
-  echo "⚠️ 常规修复失败，强制移除无法修复的包..."
+  # 第二轮：仅移除 dpkg --audit 报告的异常包（精确提取包名）
+  echo "⚠️ 常规修复失败，仅移除 dpkg --audit 报告的异常包..."
   local pkg
-  dpkg -l 2>/dev/null | awk '/^[hiuFH]/{print $2}' | while read -r pkg; do
+  # dpkg --audit 输出格式：" 包名  描述..."，提取第一列包名
+  dpkg --audit 2>/dev/null | awk '/^ /{print $1}' | sort -u | while read -r pkg; do
     [ -z "$pkg" ] && continue
+    # 安全检查：跳过基础系统包，防止误删
+    case "$pkg" in
+      apt|bash|coreutils|dpkg|libc6|systemd|util-linux|base-files|base-passwd|dash) 
+        echo "  ⚠️ 跳过系统关键包: $pkg"
+        continue ;;
+    esac
     echo "  🔧 强制移除: $pkg"
     dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
   done
