@@ -177,8 +177,8 @@ if [[ "$_adaptive_active" -eq 1 ]]; then
   _aq_threshold=""
   _aq_interval=""
   if [[ -f /usr/local/sbin/net-optimize-adaptive-qos ]]; then
-    _aq_threshold="$(grep '^THRESHOLD=' /usr/local/sbin/net-optimize-adaptive-qos 2>/dev/null | cut -d= -f2 | tr -d '"' || true)"
-    _aq_interval="$(grep '^INTERVAL=' /usr/local/sbin/net-optimize-adaptive-qos 2>/dev/null | cut -d= -f2 | tr -d '"' || true)"
+    _aq_threshold="$(grep '^THRESHOLD=' /usr/local/sbin/net-optimize-adaptive-qos 2>/dev/null | cut -d= -f2 | cut -d'#' -f1 | tr -d '"[:space:]' || true)"
+    _aq_interval="$(grep '^INTERVAL=' /usr/local/sbin/net-optimize-adaptive-qos 2>/dev/null | cut -d= -f2 | cut -d'#' -f1 | tr -d '"[:space:]' || true)"
   fi
   _aq_threshold="${_aq_threshold:-1048576}"
   _aq_interval="${_aq_interval:-2}"
