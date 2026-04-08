@@ -2198,16 +2198,22 @@ if [ -f "$CONFIG_FILE" ]; then
     fi
 
     if [ -n "$IP6_CMD" ]; then
-      # 清理旧规则
-      while :; do
-        _r6="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' || true)"
-        [ -z "$_r6" ] && break
-        while IFS= read -r rule; do
-          [ -z "$rule" ] && continue
-          del="${rule/-A POSTROUTING/-D POSTROUTING}"
-          read -r -a parts <<<"$del"
-          "$IP6_CMD" -t mangle "${parts[@]}" 2>/dev/null || true
-        done <<<"$_r6"
+      # 清理旧规则（所有 IPv6 后端都清，防止共享表残留）
+      for _ip6_clean in ip6tables ip6tables-nft ip6tables-legacy; do
+        command -v "$_ip6_clean" >/dev/null 2>&1 || continue
+        _ip6_round=0
+        while :; do
+          _r6="$("$_ip6_clean" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' || true)"
+          [ -z "$_r6" ] && break
+          _ip6_round=$((_ip6_round + 1))
+          [ "$_ip6_round" -gt 40 ] && break
+          while IFS= read -r rule; do
+            [ -z "$rule" ] && continue
+            del="${rule/-A POSTROUTING/-D POSTROUTING}"
+            read -r -a parts <<<"$del"
+            "$_ip6_clean" -t mangle "${parts[@]}" 2>/dev/null || true
+          done <<<"$_r6"
+        done
       done
       # 写入
       if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
@@ -2217,6 +2223,19 @@ if [ -f "$CONFIG_FILE" ]; then
         "$IP6_CMD" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
           -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null || true
       fi
+      # IPv6 去重
+      _ip6_dd=0
+      while :; do
+        _ip6_cnt="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+        _ip6_cnt="${_ip6_cnt%%$'\n'*}"; _ip6_cnt="${_ip6_cnt:-0}"
+        [ "$_ip6_cnt" -le 1 ] && break
+        _ip6_dd=$((_ip6_dd + 1)); [ "$_ip6_dd" -gt 20 ] && break
+        _ip6_f="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
+        [ -z "$_ip6_f" ] && break
+        _ip6_d="${_ip6_f/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a _ip6_p <<<"$_ip6_d"
+        "$IP6_CMD" -t mangle "${_ip6_p[@]}" 2>/dev/null || break
+      done
     fi
   fi
 fi
@@ -2274,6 +2293,16 @@ if [ -f "$CONFIG_FILE" ]; then
         "$_ef_dedup" -t mangle "${_ef_p[@]}" 2>/dev/null || break
       done
     done
+    # 最终验证：确认 IPv4 EF 存在，不存在则重写
+    _ef_final="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x2e' || true)"
+    _ef_final="${_ef_final%%$'\n'*}"; _ef_final="${_ef_final:-0}"
+    if [ "$_ef_final" -eq 0 ]; then
+      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+        "$IPT" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
+      else
+        "$IPT" -t mangle -A POSTROUTING $_dscp_opts 2>/dev/null || true
+      fi
+    fi
   fi
 
   # --- IPv6 EF ---
