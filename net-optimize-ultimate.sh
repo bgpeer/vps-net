@@ -117,7 +117,7 @@ echo "========================================================"
 : "${TCP_NOTSENT_LOWAT:=4096}"  # 代理场景低延迟（默认 4096，原 16384）
 : "${AGGRESSIVE_MODE:=0}"      # 激进模式：抢带宽（类似 Hy2 暴力发包思路）
 : "${ENABLE_GAME_QOS:=1}"      # 游戏低延迟 QoS（cake/prio 双方案自动选择）
-: "${ADAPTIVE_QOS:=0}"         # 自适应 QoS：流量高→抢带宽，流量低→游戏低延迟（自动切换）
+: "${ADAPTIVE_QOS:=1}"         # 自适应 QoS：流量高→抢带宽，流量低→游戏低延迟（自动切换）
 : "${ADAPTIVE_QOS_THRESHOLD:=1048576}"  # 自适应阈值（字节/秒，默认 1MB/s）
 : "${ADAPTIVE_QOS_INTERVAL:=2}"         # 采样间隔（秒）
 
