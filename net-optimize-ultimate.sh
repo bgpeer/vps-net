@@ -2073,7 +2073,7 @@ if command -v curl >/dev/null 2>&1; then
   curl -4I https://www.google.com --max-time 3 >/dev/null 2>&1 || true
 fi
 
-# === MSS Clamping（使用检测到的后端，与主脚本统一）===
+# === MSS Clamping（开机恢复，简化版）===
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
 
@@ -2081,35 +2081,9 @@ if [ -f "$CONFIG_FILE" ]; then
     MSS="${MSS_VALUE:-1452}"
     IFACE="${CLAMP_IFACE:-}"
 
-    # 后端检测：优先用 config 记录的
-    IPT="${IPT_BACKEND:-}"
-    if [ -n "$IPT" ] && command -v "$IPT" >/dev/null 2>&1; then
-      : # config 中有记录且可用，直接使用
-    else
-      # 没有记录或不可用，用试写法检测
+    IPT="${IPT_BACKEND:-iptables}"
+    if ! command -v "$IPT" >/dev/null 2>&1; then
       IPT="iptables"
-      if command -v iptables >/dev/null 2>&1; then
-        # 快速路径：legacy 警告
-        _warn="$(iptables -t mangle -S POSTROUTING 2>&1 || true)"
-        if echo "$_warn" | grep -qi 'iptables-legacy' && command -v iptables-legacy >/dev/null 2>&1; then
-          IPT="iptables-legacy"
-        else
-          # 试写验证
-          iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --set-mss 9999 2>/dev/null || true
-          _tc="$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'set-mss 9999' || true)"
-          _tc="${_tc%%$'\n'*}"; _tc="${_tc:-0}"
-          iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --set-mss 9999 2>/dev/null || true
-          if command -v iptables-legacy >/dev/null 2>&1; then
-            iptables-legacy -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-              -j TCPMSS --set-mss 9999 2>/dev/null || true
-          fi
-          if [ "$_tc" -eq 0 ] && command -v iptables-legacy >/dev/null 2>&1; then
-            IPT="iptables-legacy"
-          fi
-        fi
-      fi
     fi
 
     if command -v "$IPT" >/dev/null 2>&1; then
@@ -2118,68 +2092,11 @@ if [ -f "$CONFIG_FILE" ]; then
       modprobe ip6_tables 2>/dev/null || true
       modprobe ip6table_mangle 2>/dev/null || true
 
-      # 清理所有旧 TCPMSS（所有可用后端都清，防止共享表残留）
-      for _clean_cmd in iptables iptables-nft iptables-legacy; do
-        command -v "$_clean_cmd" >/dev/null 2>&1 || continue
-        _round=0
-        while :; do
-          _rules="$("$_clean_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'TCPMSS' || true)"
-          [ -z "$_rules" ] && break
-          _round=$((_round + 1))
-          [ "$_round" -gt 40 ] && break
-          while IFS= read -r rule; do
-            [ -z "$rule" ] && continue
-            del="${rule/-A POSTROUTING/-D POSTROUTING}"
-            read -r -a parts <<<"$del"
-            "$_clean_cmd" -t mangle "${parts[@]}" 2>/dev/null || true
-          done <<<"$_rules"
-        done
-      done
-
-      # 写入 1 条（用记录的后端）
-      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
-        "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
-          -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-      else
-        "$IPT" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-          -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-      fi
-
-      # 去重（所有后端都检查，保留 1 条）
-      for _dedup_cmd in iptables iptables-nft iptables-legacy; do
-        command -v "$_dedup_cmd" >/dev/null 2>&1 || continue
-        _dedup_r=0
-        while :; do
-          _dedup_cnt="$("$_dedup_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-          _dedup_cnt="${_dedup_cnt%%$'\n'*}"; _dedup_cnt="${_dedup_cnt:-0}"
-          [ "$_dedup_cnt" -le 1 ] && break
-          _dedup_r=$((_dedup_r + 1))
-          [ "$_dedup_r" -gt 20 ] && break
-          _first="$("$_dedup_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
-          [ -z "$_first" ] && break
-          _del="${_first/-A POSTROUTING/-D POSTROUTING}"
-          read -r -a _parts <<<"$_del"
-          "$_dedup_cmd" -t mangle "${_parts[@]}" 2>/dev/null || break
-        done
-      done
-
-      # 验证 IPv4 TCPMSS 确实写入（用所有后端检查）
-      _v4_exists=0
-      for _chk_cmd in "$IPT" iptables iptables-legacy; do
-        command -v "$_chk_cmd" >/dev/null 2>&1 || continue
-        _v4_c="$("$_chk_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-        _v4_c="${_v4_c%%$'\n'*}"; _v4_c="${_v4_c:-0}"
-        [ "$_v4_c" -ge 1 ] && { _v4_exists=1; break; }
-      done
-      [ "$_v4_exists" -eq 0 ] && {
-        if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
-          "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-        else
-          "$IPT" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-        fi
-      }
+      # IPv4 TCPMSS：删旧 + 写 1 条
+      "$IPT" -t mangle -D POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+      "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
     fi
   fi
 fi
@@ -2378,54 +2295,6 @@ if [ -f "$CONFIG_FILE" ]; then
         read -r -a _af41_6_p <<<"$_af41_6_d"
         "$IP6_CMD" -t mangle "${_af41_6_p[@]}" 2>/dev/null || break
       done
-    fi
-  fi
-fi
-
-# === 最终安全校验：确认 IPv4 TCPMSS 仍存在 + 全后端去重 ===
-if [ -f "$CONFIG_FILE" ]; then
-  . "$CONFIG_FILE"
-  if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
-    IPT="${IPT_BACKEND:-iptables}"
-    command -v "$IPT" >/dev/null 2>&1 || IPT="iptables"
-
-    # 全后端去重（防止 DSCP/QoS 操作意外追加）
-    for _final_cmd in iptables iptables-nft iptables-legacy; do
-      command -v "$_final_cmd" >/dev/null 2>&1 || continue
-      _fc=0
-      while :; do
-        _fmss="$("$_final_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-        _fmss="${_fmss%%$'\n'*}"; _fmss="${_fmss:-0}"
-        [ "$_fmss" -le 1 ] && break
-        _fc=$((_fc + 1)); [ "$_fc" -gt 20 ] && break
-        _ff="$("$_final_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
-        [ -z "$_ff" ] && break
-        _fd="${_ff/-A POSTROUTING/-D POSTROUTING}"
-        read -r -a _fp <<<"$_fd"
-        "$_final_cmd" -t mangle "${_fp[@]}" 2>/dev/null || break
-      done
-    done
-
-    # 验证是否存在
-    if command -v "$IPT" >/dev/null 2>&1; then
-      _final_exists=0
-      for _chk in "$IPT" iptables iptables-legacy; do
-        command -v "$_chk" >/dev/null 2>&1 || continue
-        _fc2="$("$_chk" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-        _fc2="${_fc2%%$'\n'*}"; _fc2="${_fc2:-0}"
-        [ "$_fc2" -ge 1 ] && { _final_exists=1; break; }
-      done
-      if [ "$_final_exists" -eq 0 ]; then
-        MSS="${MSS_VALUE:-1452}"
-        IFACE="${CLAMP_IFACE:-}"
-        if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
-          "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-        else
-          "$IPT" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-        fi
-      fi
     fi
   fi
 fi
