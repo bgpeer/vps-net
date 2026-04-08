@@ -117,6 +117,9 @@ echo "========================================================"
 : "${TCP_NOTSENT_LOWAT:=4096}"  # 代理场景低延迟（默认 4096，原 16384）
 : "${AGGRESSIVE_MODE:=0}"      # 激进模式：抢带宽（类似 Hy2 暴力发包思路）
 : "${ENABLE_GAME_QOS:=1}"      # 游戏低延迟 QoS（cake/prio 双方案自动选择）
+: "${ADAPTIVE_QOS:=0}"         # 自适应 QoS：流量高→抢带宽，流量低→游戏低延迟（自动切换）
+: "${ADAPTIVE_QOS_THRESHOLD:=1048576}"  # 自适应阈值（字节/秒，默认 1MB/s）
+: "${ADAPTIVE_QOS_INTERVAL:=2}"         # 采样间隔（秒）
 
 # 路径定义
 CONFIG_DIR="/etc/net-optimize"
@@ -1128,6 +1131,9 @@ setup_initcwnd() {
 
 # === 9.9 激进模式：网卡 tc qdisc 覆盖 ===
 setup_aggressive_tc() {
+  if [ "${ADAPTIVE_QOS:-0}" = "1" ]; then
+    return 0
+  fi
   if [ "${AGGRESSIVE_MODE:-0}" != "1" ]; then
     return 0
   fi
@@ -1152,6 +1158,9 @@ setup_aggressive_tc() {
 
 # === 9.10 游戏低延迟 QoS（cake + prio 双方案）===
 setup_game_qos() {
+  if [ "${ADAPTIVE_QOS:-0}" = "1" ]; then
+    return 0
+  fi
   if [ "${ENABLE_GAME_QOS:-1}" != "1" ]; then
     echo "⏭️ 跳过游戏 QoS 配置"
     return 0
@@ -1289,6 +1298,230 @@ setup_game_qos() {
   fi
 
   echo "  ✅ 游戏 QoS 配置完成（方案: $qos_scheme）"
+}
+
+# === 9.11 自适应 QoS（流量高→抢带宽，流量低→游戏低延迟）===
+ADAPTIVE_QOS_DAEMON="/usr/local/sbin/net-optimize-adaptive-qos"
+ADAPTIVE_QOS_SERVICE="net-optimize-adaptive-qos"
+
+setup_adaptive_qos() {
+  if [ "${ADAPTIVE_QOS:-0}" != "1" ]; then
+    # 清理：如果之前启用过，现在关闭
+    if systemctl is-active "${ADAPTIVE_QOS_SERVICE}" >/dev/null 2>&1; then
+      systemctl stop "${ADAPTIVE_QOS_SERVICE}" 2>/dev/null || true
+      systemctl disable "${ADAPTIVE_QOS_SERVICE}" 2>/dev/null || true
+      echo "🔄 自适应 QoS 已停止并关闭"
+    fi
+    return 0
+  fi
+
+  echo "🔄 自适应 QoS 配置（流量自动切换）..."
+
+  have_cmd tc || { echo "  ⚠️ tc 命令不可用，跳过"; return 0; }
+
+  local iface
+  iface="$(detect_outbound_iface 2>/dev/null || true)"
+  [ -z "$iface" ] && { echo "  ⚠️ 无法检测出口网卡，跳过"; return 0; }
+
+  # 检测 cake 可用性
+  local has_cake=0
+  if modprobe sch_cake 2>/dev/null; then
+    has_cake=1
+  fi
+
+  # 检测 iptables 后端
+  local ipt_backend=""
+  if [ -f "$CONFIG_FILE" ]; then
+    ipt_backend="$(grep '^IPT_BACKEND=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || true)"
+  fi
+  if [ -z "$ipt_backend" ] || ! have_cmd "$ipt_backend"; then
+    ipt_backend="$(_nopt_detect_ipt_backend)"
+  fi
+
+  local ip6_cmd=""
+  if [ "$ipt_backend" = "iptables-legacy" ] && have_cmd ip6tables-legacy; then
+    ip6_cmd="ip6tables-legacy"
+  elif have_cmd ip6tables; then
+    ip6_cmd="ip6tables"
+  fi
+
+  # === 写入守护脚本 ===
+  cat >"$ADAPTIVE_QOS_DAEMON" <<DAEMONEOF
+#!/usr/bin/env bash
+# net-optimize adaptive QoS daemon
+# 自动根据流量切换 抢带宽(pfifo_fast) ↔ 游戏低延迟(cake/prio)
+set -u
+
+IFACE="${iface}"
+THRESHOLD="${ADAPTIVE_QOS_THRESHOLD}"   # bytes/sec
+INTERVAL="${ADAPTIVE_QOS_INTERVAL}"     # 采样间隔秒
+HAS_CAKE=${has_cake}
+IPT_BACKEND="${ipt_backend}"
+IP6_CMD="${ip6_cmd}"
+
+# 状态：game / aggressive / unknown
+CURRENT_MODE="unknown"
+
+# ---- 切换到游戏低延迟模式 ----
+switch_to_game() {
+  [ "\$CURRENT_MODE" = "game" ] && return 0
+
+  if [ "\$HAS_CAKE" = "1" ]; then
+    tc qdisc replace dev "\$IFACE" root cake bandwidth unlimited diffserv4 nat nowash no-split-gso 2>/dev/null || {
+      # fallback prio
+      _switch_prio
+      CURRENT_MODE="game"
+      return 0
+    }
+  else
+    _switch_prio
+  fi
+
+  # 游戏 DSCP 标记：UDP 小包(≤200B, 非443) → AF41
+  _apply_game_dscp
+
+  CURRENT_MODE="game"
+  logger -t adaptive-qos "切换 → 游戏低延迟 (rate < \${THRESHOLD}B/s)"
+}
+
+_switch_prio() {
+  tc qdisc replace dev "\$IFACE" root handle 1: prio bands 3 priomap \\
+    1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 2>/dev/null || return 0
+  tc qdisc replace dev "\$IFACE" parent 1:1 handle 10: fq_codel 2>/dev/null || true
+  tc qdisc replace dev "\$IFACE" parent 1:2 handle 20: fq_codel 2>/dev/null || true
+  tc qdisc replace dev "\$IFACE" parent 1:3 handle 30: fq_codel 2>/dev/null || true
+  tc filter del dev "\$IFACE" parent 1: 2>/dev/null || true
+  tc filter add dev "\$IFACE" parent 1: protocol ip prio 1 u32 \\
+    match ip tos 0xb8 0xfc flowid 1:1 2>/dev/null || true
+  tc filter add dev "\$IFACE" parent 1: protocol ip prio 2 u32 \\
+    match ip tos 0x88 0xfc flowid 1:1 2>/dev/null || true
+  tc filter add dev "\$IFACE" parent 1: protocol ip prio 3 u32 \\
+    match ip protocol 17 0xff match u16 0x0000 0xff80 at 2 flowid 1:1 2>/dev/null || true
+}
+
+_apply_game_dscp() {
+  [ -z "\$IPT_BACKEND" ] && return 0
+  command -v "\$IPT_BACKEND" >/dev/null 2>&1 || return 0
+  local _opts="-p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41"
+  # 先清旧
+  for _cmd in "\$IPT_BACKEND" \${IP6_CMD:+"\$IP6_CMD"}; do
+    [ -n "\$_cmd" ] && command -v "\$_cmd" >/dev/null 2>&1 || continue
+    local _rules
+    _rules="\$("\$_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
+    while IFS= read -r rule; do
+      [ -z "\$rule" ] && continue
+      local del="\${rule/-A POSTROUTING/-D POSTROUTING}"
+      read -r -a parts <<<"\$del"
+      "\$_cmd" -t mangle "\${parts[@]}" 2>/dev/null || true
+    done <<<"\$_rules"
+  done
+  # 写入
+  "\$IPT_BACKEND" -t mangle -A POSTROUTING -o "\$IFACE" \$_opts 2>/dev/null || true
+  if [ -n "\$IP6_CMD" ] && command -v "\$IP6_CMD" >/dev/null 2>&1; then
+    "\$IP6_CMD" -t mangle -A POSTROUTING -o "\$IFACE" \$_opts 2>/dev/null || true
+  fi
+}
+
+_clear_game_dscp() {
+  [ -z "\$IPT_BACKEND" ] && return 0
+  command -v "\$IPT_BACKEND" >/dev/null 2>&1 || return 0
+  for _cmd in "\$IPT_BACKEND" \${IP6_CMD:+"\$IP6_CMD"}; do
+    [ -n "\$_cmd" ] && command -v "\$_cmd" >/dev/null 2>&1 || continue
+    local _rules
+    _rules="\$("\$_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
+    while IFS= read -r rule; do
+      [ -z "\$rule" ] && continue
+      local del="\${rule/-A POSTROUTING/-D POSTROUTING}"
+      read -r -a parts <<<"\$del"
+      "\$_cmd" -t mangle "\${parts[@]}" 2>/dev/null || true
+    done <<<"\$_rules"
+  done
+}
+
+# ---- 切换到抢带宽模式 ----
+switch_to_aggressive() {
+  [ "\$CURRENT_MODE" = "aggressive" ] && return 0
+
+  tc qdisc replace dev "\$IFACE" root pfifo_fast 2>/dev/null || \\
+    tc qdisc replace dev "\$IFACE" root pfifo limit 10000 2>/dev/null || true
+
+  # 清除游戏 DSCP 标记
+  _clear_game_dscp
+
+  CURRENT_MODE="aggressive"
+  logger -t adaptive-qos "切换 → 抢带宽 (rate >= \${THRESHOLD}B/s)"
+}
+
+# ---- 主循环 ----
+# 启动时先进入游戏模式
+switch_to_game
+
+prev_tx=0
+first=1
+
+while true; do
+  tx=\$(cat /sys/class/net/"\$IFACE"/statistics/tx_bytes 2>/dev/null || echo 0)
+
+  if [ "\$first" = "1" ]; then
+    prev_tx=\$tx
+    first=0
+    sleep "\$INTERVAL"
+    continue
+  fi
+
+  rate=\$(( (tx - prev_tx) / INTERVAL ))
+  prev_tx=\$tx
+
+  if [ "\$rate" -ge "\$THRESHOLD" ]; then
+    switch_to_aggressive
+  else
+    switch_to_game
+  fi
+
+  sleep "\$INTERVAL"
+done
+DAEMONEOF
+
+  chmod +x "$ADAPTIVE_QOS_DAEMON"
+
+  # === 安装 systemd 服务 ===
+  cat >"/etc/systemd/system/${ADAPTIVE_QOS_SERVICE}.service" <<SVCEOF
+[Unit]
+Description=Net-Optimize Adaptive QoS Daemon
+After=network-online.target net-optimize.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${ADAPTIVE_QOS_DAEMON}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+  systemctl daemon-reload
+  systemctl enable "${ADAPTIVE_QOS_SERVICE}.service" 2>/dev/null || true
+  systemctl restart "${ADAPTIVE_QOS_SERVICE}.service" 2>/dev/null || true
+
+  # 持久化到 config
+  if [ -f "$CONFIG_FILE" ]; then
+    grep -q '^ADAPTIVE_QOS=' "$CONFIG_FILE" 2>/dev/null \
+      && sed -i "s/^ADAPTIVE_QOS=.*/ADAPTIVE_QOS=1/" "$CONFIG_FILE" \
+      || echo "ADAPTIVE_QOS=1" >> "$CONFIG_FILE"
+    grep -q '^ADAPTIVE_QOS_IFACE=' "$CONFIG_FILE" 2>/dev/null \
+      && sed -i "s/^ADAPTIVE_QOS_IFACE=.*/ADAPTIVE_QOS_IFACE=$iface/" "$CONFIG_FILE" \
+      || echo "ADAPTIVE_QOS_IFACE=$iface" >> "$CONFIG_FILE"
+  fi
+
+  echo "  ✅ 自适应 QoS 守护进程已启动"
+  echo "    → 网卡: $iface"
+  echo "    → 阈值: $(( ADAPTIVE_QOS_THRESHOLD / 1024 )) KB/s"
+  echo "    → 采样: 每 ${ADAPTIVE_QOS_INTERVAL}s"
+  echo "    → 流量 ≥ 阈值 → pfifo_fast（抢带宽）"
+  echo "    → 流量 < 阈值 → ${has_cake:+cake}${has_cake:+/}prio（游戏低延迟）"
+  echo "    → 服务: systemctl status ${ADAPTIVE_QOS_SERVICE}"
 }
 
 # === 10. MSS Clamping ===
@@ -2312,6 +2545,13 @@ print_status() {
     printf "  ℹ️ 未启用（AGGRESSIVE_MODE=1 或 ENABLE_GAME_QOS=0）\n"
   fi
 
+  # 自适应 QoS 状态
+  if systemctl is-active "${ADAPTIVE_QOS_SERVICE:-net-optimize-adaptive-qos}" >/dev/null 2>&1; then
+    printf "\n🔄 自适应 QoS：运行中\n"
+    printf "  → 阈值: $(( ${ADAPTIVE_QOS_THRESHOLD:-1048576} / 1024 )) KB/s  采样: ${ADAPTIVE_QOS_INTERVAL:-2}s\n"
+    printf "  → 高流量→pfifo_fast(抢带宽)  低流量→cake/prio(游戏低延迟)\n"
+  fi
+
   # DSCP 规则概览
   local _dscp_v4_cnt=0 _dscp_v6_cnt=0
   for _ds_cmd in iptables iptables-legacy iptables-nft; do
@@ -2378,6 +2618,7 @@ main() {
   setup_initcwnd
   setup_aggressive_tc
   setup_game_qos
+  setup_adaptive_qos
   fix_nginx_repo
   install_boot_service
 
