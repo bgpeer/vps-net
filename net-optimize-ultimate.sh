@@ -2130,48 +2130,123 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 fi
 
-# === 最终安全校验：确认 IPv4 TCPMSS 仍存在 + 全后端去重 ===
+# === 最终兜底：用 $IPT 单后端统一去重 + 补写所有规则 ===
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
-  if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
-    IPT="${IPT_BACKEND:-iptables}"
-    command -v "$IPT" >/dev/null 2>&1 || IPT="iptables"
+  IPT="${IPT_BACKEND:-iptables}"
+  command -v "$IPT" >/dev/null 2>&1 || IPT="iptables"
+  IFACE="${CLAMP_IFACE:-}"
+  MSS="${MSS_VALUE:-1452}"
+  _qos="${GAME_QOS_SCHEME:-none}"
 
-    # 全后端去重（防止 DSCP/QoS 操作意外追加）
-    for _final_cmd in iptables iptables-nft iptables-legacy; do
-      command -v "$_final_cmd" >/dev/null 2>&1 || continue
-      _fc=0
+  IP6_CMD=""
+  if [ "$IPT" = "iptables-legacy" ] && command -v ip6tables-legacy >/dev/null 2>&1; then
+    IP6_CMD="ip6tables-legacy"
+  elif command -v ip6tables >/dev/null 2>&1; then
+    IP6_CMD="ip6tables"
+  fi
+
+  if command -v "$IPT" >/dev/null 2>&1; then
+    # --- 辅助函数：去重指定 pattern（保留 1 条）---
+    _dedup_rule() {
+      local cmd="$1" pattern="$2"
+      local dd=0
       while :; do
-        _fmss="$("$_final_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-        _fmss="${_fmss%%$'\n'*}"; _fmss="${_fmss:-0}"
-        [ "$_fmss" -le 1 ] && break
-        _fc=$((_fc + 1)); [ "$_fc" -gt 20 ] && break
-        _ff="$("$_final_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
-        [ -z "$_ff" ] && break
-        _fd="${_ff/-A POSTROUTING/-D POSTROUTING}"
-        read -r -a _fp <<<"$_fd"
-        "$_final_cmd" -t mangle "${_fp[@]}" 2>/dev/null || break
+        local cnt
+        cnt="$("$cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c "$pattern" || true)"
+        cnt="${cnt%%$'\n'*}"; cnt="${cnt:-0}"
+        [ "$cnt" -le 1 ] && return 0
+        dd=$((dd + 1)); [ "$dd" -gt 20 ] && return 0
+        local first
+        first="$("$cmd" -t mangle -S POSTROUTING 2>/dev/null | grep "$pattern" | head -n1 || true)"
+        [ -z "$first" ] && return 0
+        local d="${first/-A POSTROUTING/-D POSTROUTING}"
+        local -a p; read -r -a p <<<"$d"
+        "$cmd" -t mangle "${p[@]}" 2>/dev/null || return 0
       done
-    done
+    }
 
-    # 验证是否存在
-    if command -v "$IPT" >/dev/null 2>&1; then
-      _final_exists=0
-      for _chk in "$IPT" iptables iptables-legacy; do
-        command -v "$_chk" >/dev/null 2>&1 || continue
-        _fc2="$("$_chk" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-        _fc2="${_fc2%%$'\n'*}"; _fc2="${_fc2:-0}"
-        [ "$_fc2" -ge 1 ] && { _final_exists=1; break; }
-      done
-      if [ "$_final_exists" -eq 0 ]; then
-        MSS="${MSS_VALUE:-1452}"
-        IFACE="${CLAMP_IFACE:-}"
+    # --- 辅助函数：检查规则是否存在 ---
+    _has_rule() {
+      local cmd="$1" pattern="$2"
+      local c
+      c="$("$cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c "$pattern" || true)"
+      c="${c%%$'\n'*}"; c="${c:-0}"
+      [ "$c" -ge 1 ]
+    }
+
+    # === IPv4 TCPMSS ===
+    if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
+      _dedup_rule "$IPT" 'TCPMSS'
+      if ! _has_rule "$IPT" 'TCPMSS'; then
         if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
           "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
             -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
         else
           "$IPT" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
             -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+        fi
+      fi
+    fi
+
+    # === IPv4 DSCP EF ===
+    _dedup_rule "$IPT" 'DSCP.*0x2e'
+    if ! _has_rule "$IPT" 'DSCP.*0x2e'; then
+      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+        "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p udp --dport 443 -j DSCP --set-dscp-class EF 2>/dev/null || true
+      else
+        "$IPT" -t mangle -A POSTROUTING -p udp --dport 443 -j DSCP --set-dscp-class EF 2>/dev/null || true
+      fi
+    fi
+
+    # === IPv4 DSCP AF41 ===
+    if [ "$_qos" != "none" ]; then
+      _dedup_rule "$IPT" 'DSCP.*0x22'
+      if ! _has_rule "$IPT" 'DSCP.*0x22'; then
+        if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+          "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41 2>/dev/null || true
+        else
+          "$IPT" -t mangle -A POSTROUTING -p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41 2>/dev/null || true
+        fi
+      fi
+    fi
+  fi
+
+  # === IPv6 同样处理 ===
+  if [ -n "$IP6_CMD" ]; then
+    # IPv6 TCPMSS
+    if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
+      _dedup_rule "$IP6_CMD" 'TCPMSS'
+      if ! _has_rule "$IP6_CMD" 'TCPMSS'; then
+        _ipv6_mss=$((MSS - 20))
+        if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+          "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss "$_ipv6_mss" 2>/dev/null || true
+        else
+          "$IP6_CMD" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss "$_ipv6_mss" 2>/dev/null || true
+        fi
+      fi
+    fi
+
+    # IPv6 EF
+    _dedup_rule "$IP6_CMD" 'DSCP.*0x2e'
+    if ! _has_rule "$IP6_CMD" 'DSCP.*0x2e'; then
+      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+        "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" -p udp --dport 443 -j DSCP --set-dscp-class EF 2>/dev/null || true
+      else
+        "$IP6_CMD" -t mangle -A POSTROUTING -p udp --dport 443 -j DSCP --set-dscp-class EF 2>/dev/null || true
+      fi
+    fi
+
+    # IPv6 AF41
+    if [ "$_qos" != "none" ]; then
+      _dedup_rule "$IP6_CMD" 'DSCP.*0x22'
+      if ! _has_rule "$IP6_CMD" 'DSCP.*0x22'; then
+        if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+          "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" -p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41 2>/dev/null || true
+        else
+          "$IP6_CMD" -t mangle -A POSTROUTING -p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41 2>/dev/null || true
         fi
       fi
     fi
