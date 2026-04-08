@@ -1740,18 +1740,6 @@ setup_mss_clamping() {
     return 0
   fi
 
-  # netfilter-persistent 处理：只清 mangle 表中本脚本的规则，保留 nat/filter
-  # （nat 表含 hy2 跳端口 DNAT 等第三方规则，绝不能清）
-  if systemctl is-enabled netfilter-persistent >/dev/null 2>&1; then
-    # 清除已保存规则文件中的 mangle 段（保留 nat/filter 原样）
-    for _pf in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
-      if [ -f "$_pf" ] && grep -q '^\*mangle' "$_pf" 2>/dev/null; then
-        sed -i '/^\*mangle$/,/^COMMIT$/c\*mangle\nCOMMIT' "$_pf" 2>/dev/null || true
-      fi
-    done
-    echo "✅ 已清理 netfilter-persistent 中的 mangle 规则（nat/filter 保留）"
-  fi
-
   echo "📡 设置MSS Clamping (MSS=$MSS_VALUE)..."
 
   local iface
@@ -2083,17 +2071,6 @@ fi
 if command -v curl >/dev/null 2>&1; then
   curl -4I https://1.1.1.1 --max-time 3 >/dev/null 2>&1 || true
   curl -4I https://www.google.com --max-time 3 >/dev/null 2>&1 || true
-fi
-
-# === netfilter-persistent：只清 mangle 段，保留 nat/filter（hy2 跳端口 DNAT）===
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl stop netfilter-persistent 2>/dev/null || true
-  for _pf in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
-    if [ -f "$_pf" ] && grep -q '^\*mangle' "$_pf" 2>/dev/null; then
-      sed -i '/^\*mangle$/,/^COMMIT$/c\*mangle\nCOMMIT' "$_pf" 2>/dev/null || true
-    fi
-  done
-  systemctl start netfilter-persistent 2>/dev/null || true
 fi
 
 # === MSS Clamping（开机恢复，简化版）===
