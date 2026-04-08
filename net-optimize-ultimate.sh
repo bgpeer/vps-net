@@ -1796,22 +1796,22 @@ if [ -f "$CONFIG_FILE" ]; then
       modprobe ip_tables 2>/dev/null || true
       modprobe iptable_mangle 2>/dev/null || true
 
-      # 清理所有旧 TCPMSS（所有后端）
-      for cmd in iptables iptables-nft iptables-legacy; do
-        command -v "$cmd" >/dev/null 2>&1 || continue
-        while :; do
-          rules="$("$cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'TCPMSS' || true)"
-          [ -z "$rules" ] && break
-          while IFS= read -r rule; do
-            [ -z "$rule" ] && continue
-            del="${rule/-A POSTROUTING/-D POSTROUTING}"
-            read -r -a parts <<<"$del"
-            "$cmd" -t mangle "${parts[@]}" 2>/dev/null || true
-          done <<<"$rules"
-        done
+      # 清理所有旧 TCPMSS（仅用检测到的后端，避免跨后端干扰）
+      _round=0
+      while :; do
+        _rules="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'TCPMSS' || true)"
+        [ -z "$_rules" ] && break
+        _round=$((_round + 1))
+        [ "$_round" -gt 40 ] && break
+        while IFS= read -r rule; do
+          [ -z "$rule" ] && continue
+          del="${rule/-A POSTROUTING/-D POSTROUTING}"
+          read -r -a parts <<<"$del"
+          "$IPT" -t mangle "${parts[@]}" 2>/dev/null || true
+        done <<<"$_rules"
       done
 
-      # 用检测到的后端写入 1 条
+      # 写入 1 条
       if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
         "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
           -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
@@ -1820,8 +1820,7 @@ if [ -f "$CONFIG_FILE" ]; then
           -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
       fi
 
-      # 自动去重（用同一个后端检查，保留 1 条）
-      _dedup_cnt=0
+      # 去重（保留 1 条）
       _dedup_r=0
       while :; do
         _dedup_cnt="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
@@ -1835,6 +1834,20 @@ if [ -f "$CONFIG_FILE" ]; then
         read -r -a _parts <<<"$_del"
         "$IPT" -t mangle "${_parts[@]}" 2>/dev/null || break
       done
+
+      # 验证 IPv4 TCPMSS 确实写入
+      _v4_final="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+      _v4_final="${_v4_final%%$'\n'*}"; _v4_final="${_v4_final:-0}"
+      [ "$_v4_final" -eq 0 ] && {
+        # 重试写入
+        if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+          "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+        else
+          "$IPT" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+        fi
+      }
     fi
   fi
 fi
@@ -1878,27 +1891,84 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 fi
 
-# === DSCP 标记恢复（UDP 443 QUIC → EF）===
+# === DSCP 标记恢复（UDP 443 QUIC → EF，IPv4 + IPv6）===
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
   IPT="${IPT_BACKEND:-iptables}"
   command -v "$IPT" >/dev/null 2>&1 || IPT="iptables"
   IFACE="${CLAMP_IFACE:-}"
 
+  IP6_CMD=""
+  if [ "$IPT" = "iptables-legacy" ] && command -v ip6tables-legacy >/dev/null 2>&1; then
+    IP6_CMD="ip6tables-legacy"
+  elif command -v ip6tables >/dev/null 2>&1; then
+    IP6_CMD="ip6tables"
+  fi
+
+  _dscp_opts="-p udp --dport 443 -j DSCP --set-dscp-class EF"
+
+  # --- IPv4 EF ---
   if command -v "$IPT" >/dev/null 2>&1; then
-    _dscp_opts="-p udp --dport 443 -j DSCP --set-dscp-class EF"
-    # 清理旧 DSCP
-    "$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x2e' | while IFS= read -r rule; do
-      del="${rule/-A POSTROUTING/-D POSTROUTING}"
-      read -r -a parts <<<"$del"
-      "$IPT" -t mangle "${parts[@]}" 2>/dev/null || true
-    done || true
+    # 清理旧 EF（用 here-string 避免 pipe subshell）
+    _ef_old="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x2e' || true)"
+    if [ -n "$_ef_old" ]; then
+      while IFS= read -r rule; do
+        [ -z "$rule" ] && continue
+        del="${rule/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a parts <<<"$del"
+        "$IPT" -t mangle "${parts[@]}" 2>/dev/null || true
+      done <<<"$_ef_old"
+    fi
     # 写入
     if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
       "$IPT" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
     else
       "$IPT" -t mangle -A POSTROUTING $_dscp_opts 2>/dev/null || true
     fi
+    # 去重（保留 1 条 EF）
+    _ef_dd=0
+    while :; do
+      _ef_cnt="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x2e' || true)"
+      _ef_cnt="${_ef_cnt%%$'\n'*}"; _ef_cnt="${_ef_cnt:-0}"
+      [ "$_ef_cnt" -le 1 ] && break
+      _ef_dd=$((_ef_dd + 1)); [ "$_ef_dd" -gt 20 ] && break
+      _ef_f="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP.*0x2e' | head -n1 || true)"
+      [ -z "$_ef_f" ] && break
+      _ef_d="${_ef_f/-A POSTROUTING/-D POSTROUTING}"
+      read -r -a _ef_p <<<"$_ef_d"
+      "$IPT" -t mangle "${_ef_p[@]}" 2>/dev/null || break
+    done
+  fi
+
+  # --- IPv6 EF ---
+  if [ -n "$IP6_CMD" ]; then
+    _ef6_old="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x2e' || true)"
+    if [ -n "$_ef6_old" ]; then
+      while IFS= read -r rule; do
+        [ -z "$rule" ] && continue
+        del="${rule/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a parts <<<"$del"
+        "$IP6_CMD" -t mangle "${parts[@]}" 2>/dev/null || true
+      done <<<"$_ef6_old"
+    fi
+    if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+      "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
+    else
+      "$IP6_CMD" -t mangle -A POSTROUTING $_dscp_opts 2>/dev/null || true
+    fi
+    # 去重
+    _ef6_dd=0
+    while :; do
+      _ef6_cnt="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x2e' || true)"
+      _ef6_cnt="${_ef6_cnt%%$'\n'*}"; _ef6_cnt="${_ef6_cnt:-0}"
+      [ "$_ef6_cnt" -le 1 ] && break
+      _ef6_dd=$((_ef6_dd + 1)); [ "$_ef6_dd" -gt 20 ] && break
+      _ef6_f="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP.*0x2e' | head -n1 || true)"
+      [ -z "$_ef6_f" ] && break
+      _ef6_d="${_ef6_f/-A POSTROUTING/-D POSTROUTING}"
+      read -r -a _ef6_p <<<"$_ef6_d"
+      "$IP6_CMD" -t mangle "${_ef6_p[@]}" 2>/dev/null || break
+    done
   fi
 fi
 
@@ -1974,31 +2044,89 @@ if [ -f "$CONFIG_FILE" ]; then
 
     _game_dscp="-p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41"
 
+    # --- IPv4 AF41 ---
     if command -v "$IPT" >/dev/null 2>&1; then
-      # 清理旧 AF41
-      "$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' | while IFS= read -r rule; do
-        del="${rule/-A POSTROUTING/-D POSTROUTING}"
-        read -r -a parts <<<"$del"
-        "$IPT" -t mangle "${parts[@]}" 2>/dev/null || true
-      done || true
-      # 写入
+      _af41_old="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
+      if [ -n "$_af41_old" ]; then
+        while IFS= read -r rule; do
+          [ -z "$rule" ] && continue
+          del="${rule/-A POSTROUTING/-D POSTROUTING}"
+          read -r -a parts <<<"$del"
+          "$IPT" -t mangle "${parts[@]}" 2>/dev/null || true
+        done <<<"$_af41_old"
+      fi
       if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
         "$IPT" -t mangle -A POSTROUTING -o "$IFACE" $_game_dscp 2>/dev/null || true
       else
         "$IPT" -t mangle -A POSTROUTING $_game_dscp 2>/dev/null || true
       fi
+      # 去重（保留 1 条 AF41）
+      _af41_dd=0
+      while :; do
+        _af41_cnt="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x22' || true)"
+        _af41_cnt="${_af41_cnt%%$'\n'*}"; _af41_cnt="${_af41_cnt:-0}"
+        [ "$_af41_cnt" -le 1 ] && break
+        _af41_dd=$((_af41_dd + 1)); [ "$_af41_dd" -gt 20 ] && break
+        _af41_f="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP.*0x22' | head -n1 || true)"
+        [ -z "$_af41_f" ] && break
+        _af41_d="${_af41_f/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a _af41_p <<<"$_af41_d"
+        "$IPT" -t mangle "${_af41_p[@]}" 2>/dev/null || break
+      done
     fi
 
+    # --- IPv6 AF41 ---
     if [ -n "$IP6_CMD" ]; then
-      "$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' | while IFS= read -r rule; do
-        del="${rule/-A POSTROUTING/-D POSTROUTING}"
-        read -r -a parts <<<"$del"
-        "$IP6_CMD" -t mangle "${parts[@]}" 2>/dev/null || true
-      done || true
+      _af41_6_old="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
+      if [ -n "$_af41_6_old" ]; then
+        while IFS= read -r rule; do
+          [ -z "$rule" ] && continue
+          del="${rule/-A POSTROUTING/-D POSTROUTING}"
+          read -r -a parts <<<"$del"
+          "$IP6_CMD" -t mangle "${parts[@]}" 2>/dev/null || true
+        done <<<"$_af41_6_old"
+      fi
       if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
         "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" $_game_dscp 2>/dev/null || true
       else
         "$IP6_CMD" -t mangle -A POSTROUTING $_game_dscp 2>/dev/null || true
+      fi
+      # 去重
+      _af41_6_dd=0
+      while :; do
+        _af41_6_cnt="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x22' || true)"
+        _af41_6_cnt="${_af41_6_cnt%%$'\n'*}"; _af41_6_cnt="${_af41_6_cnt:-0}"
+        [ "$_af41_6_cnt" -le 1 ] && break
+        _af41_6_dd=$((_af41_6_dd + 1)); [ "$_af41_6_dd" -gt 20 ] && break
+        _af41_6_f="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP.*0x22' | head -n1 || true)"
+        [ -z "$_af41_6_f" ] && break
+        _af41_6_d="${_af41_6_f/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a _af41_6_p <<<"$_af41_6_d"
+        "$IP6_CMD" -t mangle "${_af41_6_p[@]}" 2>/dev/null || break
+      done
+    fi
+  fi
+fi
+
+# === 最终安全校验：确认 IPv4 TCPMSS 仍存在 ===
+if [ -f "$CONFIG_FILE" ]; then
+  . "$CONFIG_FILE"
+  if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
+    IPT="${IPT_BACKEND:-iptables}"
+    command -v "$IPT" >/dev/null 2>&1 || IPT="iptables"
+    if command -v "$IPT" >/dev/null 2>&1; then
+      _final_mss="$("$IPT" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+      _final_mss="${_final_mss%%$'\n'*}"; _final_mss="${_final_mss:-0}"
+      if [ "$_final_mss" -eq 0 ]; then
+        MSS="${MSS_VALUE:-1452}"
+        IFACE="${CLAMP_IFACE:-}"
+        if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+          "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+        else
+          "$IPT" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+        fi
       fi
     fi
   fi
