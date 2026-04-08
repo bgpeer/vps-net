@@ -176,15 +176,17 @@ if [[ "$_adaptive_active" -eq 1 ]]; then
   # 读取守护脚本中的阈值
   _aq_threshold=""
   _aq_interval=""
-  if [[ -f /usr/local/sbin/net-optimize-adaptive-qos ]]; then
-    _aq_threshold="$(grep '^THRESHOLD=' /usr/local/sbin/net-optimize-adaptive-qos 2>/dev/null | cut -d= -f2 | cut -d'#' -f1 | tr -d '"[:space:]' || true)"
-    _aq_interval="$(grep '^INTERVAL=' /usr/local/sbin/net-optimize-adaptive-qos 2>/dev/null | cut -d= -f2 | cut -d'#' -f1 | tr -d '"[:space:]' || true)"
+  if [[ -f /etc/net-optimize/adaptive-qos.conf ]]; then
+    _aq_threshold="$(python3 -c "import json;c=json.load(open('/etc/net-optimize/adaptive-qos.conf'));print(c.get('threshold',1048576))" 2>/dev/null || true)"
+    _aq_interval="$(python3 -c "import json;c=json.load(open('/etc/net-optimize/adaptive-qos.conf'));print(c.get('interval',2))" 2>/dev/null || true)"
+    _aq_has_length="$(python3 -c "import json;c=json.load(open('/etc/net-optimize/adaptive-qos.conf'));print(c.get('has_length',False))" 2>/dev/null || true)"
   fi
   _aq_threshold="${_aq_threshold:-1048576}"
   _aq_interval="${_aq_interval:-2}"
   echo "    → 阈值: $(( _aq_threshold / 1024 )) KB/s  采样: ${_aq_interval}s"
   echo "    → 流量 ≥ 阈值 → pfifo_fast（抢带宽）"
   echo "    → 流量 < 阈值 → cake/prio（游戏低延迟）"
+  [[ "${_aq_has_length:-}" == "False" ]] && yellow "    → ⚠️ -m length 不可用，AF41 标记已跳过"
 
   # 检测当前实际 qdisc 判断当前处于哪个模式
   if [[ -n "$OUT_IFACE" ]] && has tc; then
