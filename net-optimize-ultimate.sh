@@ -1740,6 +1740,17 @@ setup_mss_clamping() {
     return 0
   fi
 
+  # 禁用 netfilter-persistent（防止开机恢复旧规则导致重复）
+  if systemctl is-enabled netfilter-persistent >/dev/null 2>&1; then
+    systemctl stop netfilter-persistent 2>/dev/null || true
+    systemctl disable netfilter-persistent 2>/dev/null || true
+    # 清空保存的规则文件
+    for _pf in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+      [ -f "$_pf" ] && printf '*mangle\nCOMMIT\n*filter\nCOMMIT\n*nat\nCOMMIT\n' > "$_pf" 2>/dev/null || true
+    done
+    echo "✅ 已禁用 netfilter-persistent（防止规则重复）"
+  fi
+
   echo "📡 设置MSS Clamping (MSS=$MSS_VALUE)..."
 
   local iface
@@ -2071,6 +2082,15 @@ fi
 if command -v curl >/dev/null 2>&1; then
   curl -4I https://1.1.1.1 --max-time 3 >/dev/null 2>&1 || true
   curl -4I https://www.google.com --max-time 3 >/dev/null 2>&1 || true
+fi
+
+# === 禁用 netfilter-persistent（防止恢复旧规则导致重复）===
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl stop netfilter-persistent 2>/dev/null || true
+  # 清空已保存的规则（如果文件存在）
+  for _pf in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+    [ -f "$_pf" ] && printf '*mangle\nCOMMIT\n*filter\nCOMMIT\n*nat\nCOMMIT\n' > "$_pf" 2>/dev/null || true
+  done
 fi
 
 # === MSS Clamping（开机恢复，简化版）===
