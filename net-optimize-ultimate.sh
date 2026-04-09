@@ -2317,6 +2317,54 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 fi
 
+# === 最终去重（兜底：清除所有后端中多余的 TCPMSS 和 DSCP 规则）===
+if [ -f "$CONFIG_FILE" ]; then
+  . "$CONFIG_FILE"
+  _dedup_ipt="${IPT_BACKEND:-iptables}"
+  command -v "$_dedup_ipt" >/dev/null 2>&1 || _dedup_ipt="iptables"
+
+  _dedup_ip6=""
+  if [ "$_dedup_ipt" = "iptables-legacy" ] && command -v ip6tables-legacy >/dev/null 2>&1; then
+    _dedup_ip6="ip6tables-legacy"
+  elif command -v ip6tables >/dev/null 2>&1; then
+    _dedup_ip6="ip6tables"
+  fi
+
+  # 对每个后端，TCPMSS/DSCP 各只保留 1 条
+  for _dd_pattern in TCPMSS 'DSCP.*0x2e' 'DSCP.*0x22'; do
+    for _dd_cmd in iptables iptables-legacy iptables-nft; do
+      command -v "$_dd_cmd" >/dev/null 2>&1 || continue
+      _dd_r=0
+      while :; do
+        _dd_cnt="$("$_dd_cmd" -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -cE "$_dd_pattern" || true)"
+        _dd_cnt="${_dd_cnt%%$'\n'*}"; _dd_cnt="${_dd_cnt:-0}"
+        [ "$_dd_cnt" -le 1 ] && break
+        _dd_r=$((_dd_r + 1)); [ "$_dd_r" -gt 20 ] && break
+        _dd_first="$("$_dd_cmd" -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -E "$_dd_pattern" | head -n1 || true)"
+        [ -z "$_dd_first" ] && break
+        _dd_del="${_dd_first/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a _dd_parts <<<"$_dd_del"
+        "$_dd_cmd" -w 2 -t mangle "${_dd_parts[@]}" 2>/dev/null || break
+      done
+    done
+    for _dd_cmd in ip6tables ip6tables-legacy ip6tables-nft; do
+      command -v "$_dd_cmd" >/dev/null 2>&1 || continue
+      _dd_r=0
+      while :; do
+        _dd_cnt="$("$_dd_cmd" -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -cE "$_dd_pattern" || true)"
+        _dd_cnt="${_dd_cnt%%$'\n'*}"; _dd_cnt="${_dd_cnt:-0}"
+        [ "$_dd_cnt" -le 1 ] && break
+        _dd_r=$((_dd_r + 1)); [ "$_dd_r" -gt 20 ] && break
+        _dd_first="$("$_dd_cmd" -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -E "$_dd_pattern" | head -n1 || true)"
+        [ -z "$_dd_first" ] && break
+        _dd_del="${_dd_first/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a _dd_parts <<<"$_dd_del"
+        "$_dd_cmd" -w 2 -t mangle "${_dd_parts[@]}" 2>/dev/null || break
+      done
+    done
+  done
+fi
+
 echo "[$(date)] Net-Optimize v3.6.0 开机优化完成"
 APPLYEOF
 
