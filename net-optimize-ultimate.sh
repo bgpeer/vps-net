@@ -1741,13 +1741,17 @@ setup_mss_clamping() {
   fi
 
   # 清理 netfilter-persistent 保存文件中的 mangle 规则（防止开机恢复旧 MSS/DSCP 规则导致重复）
-  # 注意：不 stop/disable netfilter-persistent，它负责恢复 nat 表的端口跳跃规则
+  # 注意：保留 netfilter-persistent 启用状态，它负责恢复 nat 表的端口跳跃规则
   for _pf in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
     if [ -f "$_pf" ] && grep -q '^\*mangle' "$_pf" 2>/dev/null; then
       sed -i '/^\*mangle$/,/^COMMIT$/d' "$_pf" 2>/dev/null || true
       echo "  ℹ️ 已从 $_pf 中移除 mangle 段"
     fi
   done
+  # 确保 netfilter-persistent 处于启用状态（可能被旧版脚本禁用过）
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files netfilter-persistent.service >/dev/null 2>&1; then
+    systemctl enable netfilter-persistent 2>/dev/null || true
+  fi
 
   echo "📡 设置MSS Clamping (MSS=$MSS_VALUE)..."
 
