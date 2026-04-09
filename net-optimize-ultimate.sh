@@ -2118,12 +2118,20 @@ if [ -f "$CONFIG_FILE" ]; then
   modprobe ip6_tables 2>/dev/null || true
   modprobe ip6table_mangle 2>/dev/null || true
 
+  # 日志：flush 前规则数
+  _pre_cnt="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+  logger -t net-optimize "BOOT: flush前 TCPMSS=$_pre_cnt"
+
   for _fc in iptables iptables-legacy iptables-nft; do
     command -v "$_fc" >/dev/null 2>&1 && "$_fc" -w 2 -t mangle -F POSTROUTING 2>/dev/null || true
   done
   for _fc in ip6tables ip6tables-legacy ip6tables-nft; do
     command -v "$_fc" >/dev/null 2>&1 && "$_fc" -w 2 -t mangle -F POSTROUTING 2>/dev/null || true
   done
+
+  # 日志：flush 后规则数
+  _post_flush="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+  logger -t net-optimize "BOOT: flush后 TCPMSS=$_post_flush"
 
   # --- 第二步：写入 MSS Clamping ---
   if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
@@ -2171,9 +2179,12 @@ if [ -f "$CONFIG_FILE" ]; then
       "$IP6_CMD" -t mangle -A POSTROUTING $_dscp_opts 2>/dev/null || true
     fi
   fi
-fi
 
-# === initcwnd 恢复 ===
+  # 日志：add 后规则数
+  _post_add="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+  _post_ef="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP' || true)"
+  logger -t net-optimize "BOOT: add后 TCPMSS=$_post_add DSCP=$_post_ef"
+fi
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
   _cwnd="${INITCWND:-20}"
@@ -2364,6 +2375,12 @@ if [ -f "$CONFIG_FILE" ]; then
     done
   done
 fi
+
+# 日志：最终规则数
+_final_tcpmss="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+_final_ef="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x2e' || true)"
+_final_af41="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x22' || true)"
+logger -t net-optimize "BOOT: 最终 TCPMSS=$_final_tcpmss EF=$_final_ef AF41=$_final_af41"
 
 echo "[$(date)] Net-Optimize v3.6.0 开机优化完成"
 APPLYEOF
