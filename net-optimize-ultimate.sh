@@ -2096,98 +2096,11 @@ if command -v systemctl >/dev/null 2>&1; then
   done
 fi
 
-# === MSS Clamping（开机恢复，简化版）===
+# === 开机恢复 mangle POSTROUTING 规则（MSS + DSCP）===
+# 策略：先 flush 所有后端的 mangle POSTROUTING，再统一写入，彻底避免重复
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
 
-  if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
-    MSS="${MSS_VALUE:-1452}"
-    IFACE="${CLAMP_IFACE:-}"
-
-    IPT="${IPT_BACKEND:-iptables}"
-    if ! command -v "$IPT" >/dev/null 2>&1; then
-      IPT="iptables"
-    fi
-
-    if command -v "$IPT" >/dev/null 2>&1; then
-      modprobe ip_tables 2>/dev/null || true
-      modprobe iptable_mangle 2>/dev/null || true
-      modprobe ip6_tables 2>/dev/null || true
-      modprobe ip6table_mangle 2>/dev/null || true
-
-      # 先清除所有后端的 TCPMSS 规则（防止 netfilter-persistent 恢复导致重复）
-      for _boot_cmd in iptables iptables-legacy iptables-nft; do
-        command -v "$_boot_cmd" >/dev/null 2>&1 || continue
-        _boot_round=0
-        while _boot_rules="$("$_boot_cmd" -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' || true)"; do
-          [ -z "$_boot_rules" ] && break
-          _boot_round=$((_boot_round + 1))
-          [ "$_boot_round" -gt 30 ] && break
-          echo "$_boot_rules" | head -n1 | while IFS= read -r _br; do
-            _bd="${_br/-A POSTROUTING/-D POSTROUTING}"
-            eval "$_boot_cmd" -w 2 -t mangle $_bd 2>/dev/null || true
-          done
-        done
-      done
-
-      # 写入 1 条 IPv4 TCPMSS
-      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
-        "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
-          -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-      else
-        "$IPT" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-          -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-      fi
-    fi
-  fi
-fi
-
-# === IPv6 MSS Clamping（开机恢复）===
-if [ -f "$CONFIG_FILE" ]; then
-  . "$CONFIG_FILE"
-  if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
-    MSS="${MSS_VALUE:-1452}"
-    IFACE="${CLAMP_IFACE:-}"
-    IPV6_MSS=$((MSS - 20))
-
-    IP6_CMD=""
-    if [ "${IPT:-iptables}" = "iptables-legacy" ] && command -v ip6tables-legacy >/dev/null 2>&1; then
-      IP6_CMD="ip6tables-legacy"
-    elif command -v ip6tables >/dev/null 2>&1; then
-      IP6_CMD="ip6tables"
-    fi
-
-    if [ -n "$IP6_CMD" ]; then
-      # 先清除所有后端的 IPv6 TCPMSS
-      for _boot_ip6 in ip6tables ip6tables-legacy ip6tables-nft; do
-        command -v "$_boot_ip6" >/dev/null 2>&1 || continue
-        _boot_round=0
-        while _boot_rules="$("$_boot_ip6" -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' || true)"; do
-          [ -z "$_boot_rules" ] && break
-          _boot_round=$((_boot_round + 1))
-          [ "$_boot_round" -gt 30 ] && break
-          echo "$_boot_rules" | head -n1 | while IFS= read -r _br; do
-            _bd="${_br/-A POSTROUTING/-D POSTROUTING}"
-            eval "$_boot_ip6" -w 2 -t mangle $_bd 2>/dev/null || true
-          done
-        done
-      done
-
-      # 写入 1 条 IPv6 TCPMSS
-      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
-        "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
-          -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null || true
-      else
-        "$IP6_CMD" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-          -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null || true
-      fi
-    fi
-  fi
-fi
-
-# === DSCP 标记恢复（UDP 443 QUIC → EF，IPv4 + IPv6）===
-if [ -f "$CONFIG_FILE" ]; then
-  . "$CONFIG_FILE"
   IPT="${IPT_BACKEND:-iptables}"
   command -v "$IPT" >/dev/null 2>&1 || IPT="iptables"
   IFACE="${CLAMP_IFACE:-}"
@@ -2199,37 +2112,50 @@ if [ -f "$CONFIG_FILE" ]; then
     IP6_CMD="ip6tables"
   fi
 
-  # 先清除所有后端的 DSCP 规则（防止重复）
-  for _boot_cmd in iptables iptables-legacy iptables-nft; do
-    command -v "$_boot_cmd" >/dev/null 2>&1 || continue
-    _boot_round=0
-    while _boot_rules="$("$_boot_cmd" -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP' || true)"; do
-      [ -z "$_boot_rules" ] && break
-      _boot_round=$((_boot_round + 1))
-      [ "$_boot_round" -gt 30 ] && break
-      echo "$_boot_rules" | head -n1 | while IFS= read -r _br; do
-        _bd="${_br/-A POSTROUTING/-D POSTROUTING}"
-        eval "$_boot_cmd" -w 2 -t mangle $_bd 2>/dev/null || true
-      done
-    done
+  # --- 第一步：flush 所有后端的 mangle POSTROUTING ---
+  modprobe ip_tables 2>/dev/null || true
+  modprobe iptable_mangle 2>/dev/null || true
+  modprobe ip6_tables 2>/dev/null || true
+  modprobe ip6table_mangle 2>/dev/null || true
+
+  for _fc in iptables iptables-legacy iptables-nft; do
+    command -v "$_fc" >/dev/null 2>&1 && "$_fc" -w 2 -t mangle -F POSTROUTING 2>/dev/null || true
   done
-  for _boot_ip6 in ip6tables ip6tables-legacy ip6tables-nft; do
-    command -v "$_boot_ip6" >/dev/null 2>&1 || continue
-    _boot_round=0
-    while _boot_rules="$("$_boot_ip6" -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP' || true)"; do
-      [ -z "$_boot_rules" ] && break
-      _boot_round=$((_boot_round + 1))
-      [ "$_boot_round" -gt 30 ] && break
-      echo "$_boot_rules" | head -n1 | while IFS= read -r _br; do
-        _bd="${_br/-A POSTROUTING/-D POSTROUTING}"
-        eval "$_boot_ip6" -w 2 -t mangle $_bd 2>/dev/null || true
-      done
-    done
+  for _fc in ip6tables ip6tables-legacy ip6tables-nft; do
+    command -v "$_fc" >/dev/null 2>&1 && "$_fc" -w 2 -t mangle -F POSTROUTING 2>/dev/null || true
   done
 
+  # --- 第二步：写入 MSS Clamping ---
+  if [ "${ENABLE_MSS_CLAMP:-0}" = "1" ]; then
+    MSS="${MSS_VALUE:-1452}"
+    IPV6_MSS=$((MSS - 20))
+
+    # IPv4 TCPMSS
+    if command -v "$IPT" >/dev/null 2>&1; then
+      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+        "$IPT" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+          -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+      else
+        "$IPT" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+          -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+      fi
+    fi
+
+    # IPv6 TCPMSS
+    if [ -n "$IP6_CMD" ] && command -v "$IP6_CMD" >/dev/null 2>&1; then
+      if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
+        "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+          -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null || true
+      else
+        "$IP6_CMD" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+          -j TCPMSS --set-mss "$IPV6_MSS" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  # --- 第三步：写入 DSCP EF（QUIC UDP 443）---
   _dscp_opts="-p udp --dport 443 -j DSCP --set-dscp-class EF"
 
-  # --- IPv4 EF ---
   if command -v "$IPT" >/dev/null 2>&1; then
     if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
       "$IPT" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
@@ -2238,7 +2164,6 @@ if [ -f "$CONFIG_FILE" ]; then
     fi
   fi
 
-  # --- IPv6 EF ---
   if [ -n "$IP6_CMD" ] && command -v "$IP6_CMD" >/dev/null 2>&1; then
     if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
       "$IP6_CMD" -t mangle -A POSTROUTING -o "$IFACE" $_dscp_opts 2>/dev/null || true
