@@ -1859,7 +1859,6 @@ EOF
       done
 
       # 写入 IPv6 MSS 规则（MSS 值与 IPv4 一致）
-      local IPv6 MSS 规则（MSS 值与 IPv4 一致）
       local ipv6_mss=$((MSS_VALUE - 20))  # IPv6 头比 IPv4 大 20 字节
       if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
         "$ip6_cmd" -t mangle -A POSTROUTING -o "$iface" -p tcp --tcp-flags SYN,RST SYN \
