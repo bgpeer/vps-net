@@ -1740,16 +1740,14 @@ setup_mss_clamping() {
     return 0
   fi
 
-  # 禁用 netfilter-persistent（防止开机恢复旧规则导致重复）
-  if systemctl is-enabled netfilter-persistent >/dev/null 2>&1; then
-    systemctl stop netfilter-persistent 2>/dev/null || true
-    systemctl disable netfilter-persistent 2>/dev/null || true
-    # 清空保存的规则文件
-    for _pf in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
-      [ -f "$_pf" ] && printf '*mangle\nCOMMIT\n*filter\nCOMMIT\n*nat\nCOMMIT\n' > "$_pf" 2>/dev/null || true
-    done
-    echo "✅ 已禁用 netfilter-persistent（防止规则重复）"
-  fi
+  # 清理 netfilter-persistent 保存文件中的 mangle 规则（防止开机恢复旧 MSS/DSCP 规则导致重复）
+  # 注意：不 stop/disable netfilter-persistent，它负责恢复 nat 表的端口跳跃规则
+  for _pf in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+    if [ -f "$_pf" ] && grep -q '^\*mangle' "$_pf" 2>/dev/null; then
+      sed -i '/^\*mangle$/,/^COMMIT$/d' "$_pf" 2>/dev/null || true
+      echo "  ℹ️ 已从 $_pf 中移除 mangle 段"
+    fi
+  done
 
   echo "📡 设置MSS Clamping (MSS=$MSS_VALUE)..."
 
@@ -2084,12 +2082,13 @@ if command -v curl >/dev/null 2>&1; then
   curl -4I https://www.google.com --max-time 3 >/dev/null 2>&1 || true
 fi
 
-# === 禁用 netfilter-persistent（防止恢复旧规则导致重复）===
+# === 清理 netfilter-persistent 保存的 mangle 规则（防止与本脚本重复）===
+# 不 stop netfilter-persistent，保留 nat 表（端口跳跃等）
 if command -v systemctl >/dev/null 2>&1; then
-  systemctl stop netfilter-persistent 2>/dev/null || true
-  # 清空已保存的规则（如果文件存在）
   for _pf in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
-    [ -f "$_pf" ] && printf '*mangle\nCOMMIT\n*filter\nCOMMIT\n*nat\nCOMMIT\n' > "$_pf" 2>/dev/null || true
+    if [ -f "$_pf" ] && grep -q '^\*mangle' "$_pf" 2>/dev/null; then
+      sed -i '/^\*mangle$/,/^COMMIT$/d' "$_pf" 2>/dev/null || true
+    fi
   done
 fi
 
