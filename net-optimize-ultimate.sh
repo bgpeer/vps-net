@@ -2052,6 +2052,14 @@ install_boot_service() {
 #!/usr/bin/env bash
 # 开机恢复脚本：不使用 set -e，确保所有步骤都能执行到
 
+# 文件锁：防止多实例并发执行
+LOCKFILE="/var/run/net-optimize-apply.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+  echo "[$(date)] net-optimize-apply: 另一实例正在运行，跳过"
+  exit 0
+fi
+
 MODULES_FILE="/etc/net-optimize/modules.list"
 if [ -f "$MODULES_FILE" ]; then
   while IFS= read -r module; do
