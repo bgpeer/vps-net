@@ -1515,7 +1515,7 @@ class AdaptiveQoS:
         if self.mode == "aggressive":
             return
         self._apply_pfifo()
-        self._clear_af41()
+        self._apply_af41()
         self.mode = "aggressive"
         log.info("切换 → 抢带宽 (rate >= %d B/s)", self.threshold)
 
