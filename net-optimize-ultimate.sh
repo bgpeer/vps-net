@@ -2715,8 +2715,29 @@ print_status() {
 }
 
 # === 14. 主流程 ===
+
+# 低内存环境保障：总内存 < 2GB 且无 swap 时自动创建 512MB 临时 swap
+_ensure_swap() {
+  local total_kb swap_kb swap_file="/tmp/.net-optimize-swap"
+  total_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 4194304)"
+  swap_kb="$(awk '/SwapTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 1)"
+  [ "$total_kb" -lt 2097152 ] && [ "$swap_kb" -eq 0 ] || return 0
+  echo "⚠️ 内存 ${total_kb}KB 且无 swap，自动创建 512MB 临时 swap..."
+  if dd if=/dev/zero of="$swap_file" bs=1M count=512 status=none 2>/dev/null \
+     && chmod 600 "$swap_file" \
+     && mkswap "$swap_file" >/dev/null 2>&1 \
+     && swapon "$swap_file" 2>/dev/null; then
+    echo "  ✅ 临时 swap 已启用"
+    trap 'swapoff "$swap_file" 2>/dev/null; rm -f "$swap_file"' EXIT
+  else
+    rm -f "$swap_file"
+    echo "  ℹ️ swap 创建失败，继续运行"
+  fi
+}
+
 main() {
   require_root
+  _ensure_swap
 
   echo "🚀 Net-Optimize-Ultimate v3.7.0 启动..."
   echo "========================================================"
