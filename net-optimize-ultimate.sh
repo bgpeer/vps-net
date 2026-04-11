@@ -615,7 +615,7 @@ write_sysctl_conf() {
     echo "net.ipv4.tcp_keepalive_time = 600"
     echo "net.ipv4.tcp_keepalive_intvl = 15"
     echo "net.ipv4.tcp_keepalive_probes = 2"
-    echo "net.ipv4.tcp_max_tw_buckets = 5000"
+    echo "net.ipv4.tcp_max_tw_buckets = 32768"
     echo "net.ipv4.ip_local_port_range = 1024 65535"
     echo
 
@@ -634,17 +634,16 @@ write_sysctl_conf() {
     echo "net.ipv4.tcp_orphan_retries = 1"
     echo "net.ipv4.tcp_retries2 = 5"
     echo "net.ipv4.tcp_synack_retries = 1"
-    echo "net.ipv4.tcp_rfc1337 = 0"
     echo "net.ipv4.tcp_early_retrans = 3"
     echo
     # 注：tcp_low_latency 在 4.14+ 已移除；tcp_fack / tcp_frto 在 BBR 下无实际作用
     # 不再写入，避免 sysctl -e 报 unknown key 警告
 
-    echo "# === 内存缓冲区优化（64MB方案）==="
+    echo "# === 内存缓冲区优化（max=64MB，default=256KB 让 TCP autotuning 自行扩展）==="
     echo "net.core.rmem_max = 67108864"
     echo "net.core.wmem_max = 67108864"
-    echo "net.core.rmem_default = 67108864"
-    echo "net.core.wmem_default = 67108864"
+    echo "net.core.rmem_default = 262144"
+    echo "net.core.wmem_default = 262144"
     echo "net.core.optmem_max = 65536"
     echo "net.ipv4.tcp_rmem = 4096 87380 67108864"
     echo "net.ipv4.tcp_wmem = 4096 65536 67108864"
@@ -727,7 +726,7 @@ write_sysctl_conf() {
     echo "vm.mmap_min_addr = 65536"
     echo "vm.max_map_count = 1048576"
     echo "vm.swappiness = 1"
-    echo "vm.overcommit_memory = 1"
+    echo "vm.overcommit_memory = 2"  # 适度超量（commit_limit=swap+RAM*50%），避免 = 1 彻底关闭 OOM 保护导致内存耗尽
     echo "kernel.pid_max = 4194304"
     echo
     echo "fs.protected_fifos = 1"
@@ -850,8 +849,8 @@ setup_nic_offload() {
     local rx_max tx_max
     rx_max="$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set.*/{found=1} found && /RX:/{print $2; exit}' || true)"
     tx_max="$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set.*/{found=1} found && /TX:/{print $2; exit}' || true)"
-    [ -n "$rx_max" ] && [ "$rx_max" -gt 0 ] 2>/dev/null && ethtool -G "$iface" rx "$rx_max" 2>/dev/null || true
-    [ -n "$tx_max" ] && [ "$tx_max" -gt 0 ] 2>/dev/null && ethtool -G "$iface" tx "$tx_max" 2>/dev/null || true
+    [ -n "$rx_max" ] && [ "$rx_max" -gt 0 ] && ethtool -G "$iface" rx "$rx_max" 2>/dev/null || true
+    [ -n "$tx_max" ] && [ "$tx_max" -gt 0 ] && ethtool -G "$iface" tx "$tx_max" 2>/dev/null || true
     echo "  ⚡ 激进模式: ring buffer 已最大化"
   fi
 
@@ -968,29 +967,16 @@ setup_dscp_marking() {
   done
 
   # 写入新规则：UDP 443 (QUIC) 标记为 EF
-  local rule_opts="-p udp --dport 443 -j DSCP --set-dscp-class EF"
+  local -a rule_opts=(-p udp --dport 443 -j DSCP --set-dscp-class EF)
   if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
-    "$ipt_backend" -t mangle -A POSTROUTING -o "$iface" $rule_opts 2>/dev/null || true
+    "$ipt_backend" -t mangle -A POSTROUTING -o "$iface" "${rule_opts[@]}" 2>/dev/null || true
   else
-    "$ipt_backend" -t mangle -A POSTROUTING $rule_opts 2>/dev/null || true
+    "$ipt_backend" -t mangle -A POSTROUTING "${rule_opts[@]}" 2>/dev/null || true
   fi
 
   # IPv4 DSCP 去重（保留 1 条）
-  local _dscp_cnt _dscp_dd=0
-  while :; do
-    _dscp_cnt="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP' || true)"
-    _dscp_cnt="${_dscp_cnt%%$'\n'*}"; _dscp_cnt="${_dscp_cnt:-0}"
-    [ "$_dscp_cnt" -le 1 ] && break
-    _dscp_dd=$((_dscp_dd + 1))
-    [ "$_dscp_dd" -gt 20 ] && break
-    local _dscp_first
-    _dscp_first="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP' | head -n1 || true)"
-    [ -z "$_dscp_first" ] && break
-    local _dscp_del="${_dscp_first/-A POSTROUTING/-D POSTROUTING}"
-    local -a _dscp_parts
-    read -r -a _dscp_parts <<<"$_dscp_del"
-    "$ipt_backend" -t mangle "${_dscp_parts[@]}" 2>/dev/null || break
-  done
+  # IPv4 DSCP 去重（保留 1 条）
+  _nopt_dedup_rules "$ipt_backend" mangle POSTROUTING 'DSCP'
 
   # IPv6 DSCP（如果有 ip6tables 对应后端）
   local ip6_cmd=""
@@ -1015,27 +1001,13 @@ setup_dscp_marking() {
     fi
 
     if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
-      "$ip6_cmd" -t mangle -A POSTROUTING -o "$iface" $rule_opts 2>/dev/null || true
+      "$ip6_cmd" -t mangle -A POSTROUTING -o "$iface" "${rule_opts[@]}" 2>/dev/null || true
     else
-      "$ip6_cmd" -t mangle -A POSTROUTING $rule_opts 2>/dev/null || true
+      "$ip6_cmd" -t mangle -A POSTROUTING "${rule_opts[@]}" 2>/dev/null || true
     fi
 
     # IPv6 DSCP 去重
-    local _dscp6_cnt _dscp6_dd=0
-    while :; do
-      _dscp6_cnt="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP' || true)"
-      _dscp6_cnt="${_dscp6_cnt%%$'\n'*}"; _dscp6_cnt="${_dscp6_cnt:-0}"
-      [ "$_dscp6_cnt" -le 1 ] && break
-      _dscp6_dd=$((_dscp6_dd + 1))
-      [ "$_dscp6_dd" -gt 20 ] && break
-      local _d6f
-      _d6f="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP' | head -n1 || true)"
-      [ -z "$_d6f" ] && break
-      local _d6del="${_d6f/-A POSTROUTING/-D POSTROUTING}"
-      local -a _d6p
-      read -r -a _d6p <<<"$_d6del"
-      "$ip6_cmd" -t mangle "${_d6p[@]}" 2>/dev/null || break
-    done
+    _nopt_dedup_rules "$ip6_cmd" mangle POSTROUTING 'DSCP'
   fi
 
   echo "  ✅ UDP 443 (QUIC) DSCP=EF 已标记（$ipt_backend）"
@@ -1088,23 +1060,14 @@ setup_initcwnd() {
 
   echo "  ℹ️ 平均 RTT: ${avg_rtt}ms → initcwnd=$initcwnd"
 
-  # 辅助函数：从路由字符串中剥离 ip route change 不接受的参数
-  _strip_route_params() {
-    echo "$1" | sed -E \
-      's/ initcwnd [0-9]+//g;
-       s/ initrwnd [0-9]+//g;
-       s/ expires [0-9]+sec//g;
-       s/ hoplimit [0-9]+//g;
-       s/ pref [a-z]+//g'
-  }
-
   # 获取默认路由并设置 initcwnd + initrwnd
   local default_gw
   default_gw="$(ip -4 route show default 2>/dev/null | head -n1 || true)"
   if [ -n "$default_gw" ]; then
     local clean_gw
     clean_gw="$(_strip_route_params "$default_gw")"
-    ip route change $clean_gw initcwnd "$initcwnd" initrwnd "$initcwnd" 2>/dev/null || true
+    local -a gw_parts; read -ra gw_parts <<<"$clean_gw"
+    ip route change "${gw_parts[@]}" initcwnd "$initcwnd" initrwnd "$initcwnd" 2>/dev/null || true
     echo "  ✅ IPv4 默认路由 initcwnd=$initcwnd initrwnd=$initcwnd"
   fi
 
@@ -1114,7 +1077,8 @@ setup_initcwnd() {
   if [ -n "$default_gw6" ]; then
     local clean_gw6
     clean_gw6="$(_strip_route_params "$default_gw6")"
-    ip -6 route change $clean_gw6 initcwnd "$initcwnd" initrwnd "$initcwnd" 2>/dev/null || true
+    local -a gw6_parts; read -ra gw6_parts <<<"$clean_gw6"
+    ip -6 route change "${gw6_parts[@]}" initcwnd "$initcwnd" initrwnd "$initcwnd" 2>/dev/null || true
     echo "  ✅ IPv6 默认路由 initcwnd=$initcwnd initrwnd=$initcwnd"
   fi
 
@@ -1271,19 +1235,19 @@ setup_game_qos() {
 
     # 写入新规则：UDP 小包（≤128 字节）且非 443 端口 → AF41
     # -m length 匹配 IP 总长度（含头），UDP 游戏包通常 <200 字节
-    local _game_dscp_opts="-p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41"
+    local -a _game_dscp_opts=(-p udp ! --dport 443 -m length --length 0:200 -j DSCP --set-dscp-class AF41)
     if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
-      "$ipt_backend" -t mangle -A POSTROUTING -o "$iface" $_game_dscp_opts 2>/dev/null || true
+      "$ipt_backend" -t mangle -A POSTROUTING -o "$iface" "${_game_dscp_opts[@]}" 2>/dev/null || true
     else
-      "$ipt_backend" -t mangle -A POSTROUTING $_game_dscp_opts 2>/dev/null || true
+      "$ipt_backend" -t mangle -A POSTROUTING "${_game_dscp_opts[@]}" 2>/dev/null || true
     fi
 
     # IPv6 同样处理
     if [ -n "$ip6_cmd" ]; then
       if [ -n "$iface" ] && [ "$iface" != "unknown" ]; then
-        "$ip6_cmd" -t mangle -A POSTROUTING -o "$iface" $_game_dscp_opts 2>/dev/null || true
+        "$ip6_cmd" -t mangle -A POSTROUTING -o "$iface" "${_game_dscp_opts[@]}" 2>/dev/null || true
       else
-        "$ip6_cmd" -t mangle -A POSTROUTING $_game_dscp_opts 2>/dev/null || true
+        "$ip6_cmd" -t mangle -A POSTROUTING "${_game_dscp_opts[@]}" 2>/dev/null || true
       fi
     fi
 
@@ -1654,6 +1618,35 @@ _nopt_apply_one_tcpmss() {
   return 1
 }
 
+# --- iptables 规则去重：保留 keep 条，其余删除 ---
+# 用法: _nopt_dedup_rules <cmd> <table> <chain> <grep-pattern> [keep=1]
+_nopt_dedup_rules() {
+  local cmd="$1" table="$2" chain="$3" pattern="$4" keep="${5:-1}"
+  local round=0 cnt first del
+  local -a parts
+  while :; do
+    cnt="$("$cmd" -t "$table" -S "$chain" 2>/dev/null | grep -cE "$pattern" || true)"
+    cnt="${cnt%%$'\n'*}"; cnt="${cnt:-0}"
+    [ "$cnt" -le "$keep" ] && break
+    round=$((round + 1)); [ "$round" -gt 20 ] && break
+    first="$("$cmd" -t "$table" -S "$chain" 2>/dev/null | grep -E "$pattern" | head -n1 || true)"
+    [ -z "$first" ] && break
+    del="${first//-A ${chain}/-D ${chain}}"
+    read -ra parts <<<"$del"
+    "$cmd" -t "$table" "${parts[@]}" 2>/dev/null || break
+  done
+}
+
+# --- 从路由字符串中剥离 ip route change 不接受的参数 ---
+_strip_route_params() {
+  echo "$1" | sed -E \
+    's/ initcwnd [0-9]+//g;
+     s/ initrwnd [0-9]+//g;
+     s/ expires [0-9]+sec//g;
+     s/ hoplimit [0-9]+//g;
+     s/ pref [a-z]+//g'
+}
+
 # --- 检测 iptables 实际可用后端 ---
 # 有些系统同时装了 iptables-nft 和 iptables-legacy，默认 iptables 指向 nft，
 # 但 legacy tables 存在时 nft 后端写入会静默失败或被忽略。
@@ -1800,24 +1793,11 @@ EOF
   fi
 
   # 3) 验证 + 自动去重（用同一个后端检查）
-  local cnt dedup_round=0
-  while :; do
-    cnt="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-    cnt="${cnt%%$'\n'*}"; cnt="${cnt:-0}"
-    [ "$cnt" -le 1 ] && break
+  _nopt_dedup_rules "$ipt_backend" mangle POSTROUTING 'TCPMSS'
 
-    dedup_round=$((dedup_round + 1))
-    [ "$dedup_round" -gt 20 ] && { echo "⚠️ TCPMSS 去重超限，跳过"; break; }
-
-    local first_rule
-    first_rule="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
-    [ -z "$first_rule" ] && break
-    local del_rule="${first_rule/-A POSTROUTING/-D POSTROUTING}"
-    local -a del_parts
-    read -r -a del_parts <<<"$del_rule"
-    "$ipt_backend" -t mangle "${del_parts[@]}" 2>/dev/null || break
-  done
-
+  local cnt
+  cnt="$("$ipt_backend" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
+  cnt="${cnt%%$'\n'*}"; cnt="${cnt:-0}"
   if [ "$cnt" -eq 1 ]; then
     echo "✅ TCPMSS 规则数量：1（正常）"
   elif [ "$cnt" -eq 0 ]; then
@@ -1868,26 +1848,12 @@ EOF
           -j TCPMSS --set-mss "$ipv6_mss" 2>/dev/null || true
       fi
 
+      # IPv6 去重（保留 1 条）
+      _nopt_dedup_rules "$ip6_cmd" mangle POSTROUTING 'TCPMSS'
+
       local ip6_cnt
       ip6_cnt="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
       ip6_cnt="${ip6_cnt%%$'\n'*}"; ip6_cnt="${ip6_cnt:-0}"
-
-      # IPv6 去重（保留 1 条，和 IPv4 逻辑一致）
-      local ip6_dedup=0
-      while [ "$ip6_cnt" -gt 1 ]; do
-        ip6_dedup=$((ip6_dedup + 1))
-        [ "$ip6_dedup" -gt 20 ] && { echo "  ⚠️ IPv6 TCPMSS 去重超限"; break; }
-        local ip6_first
-        ip6_first="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | head -n1 || true)"
-        [ -z "$ip6_first" ] && break
-        local ip6_del="${ip6_first/-A POSTROUTING/-D POSTROUTING}"
-        local -a ip6_del_parts
-        read -r -a ip6_del_parts <<<"$ip6_del"
-        "$ip6_cmd" -t mangle "${ip6_del_parts[@]}" 2>/dev/null || break
-        ip6_cnt="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-        ip6_cnt="${ip6_cnt%%$'\n'*}"; ip6_cnt="${ip6_cnt:-0}"
-      done
-
       echo "  ✅ IPv6 MSS=$ipv6_mss ($ip6_cmd), 规则数：$ip6_cnt"
     else
       echo "  ℹ️ ip6tables 不可用，跳过 IPv6 MSS"
@@ -2061,6 +2027,11 @@ if ! flock -n 200; then
 fi
 
 MODULES_FILE="/etc/net-optimize/modules.list"
+CONFIG_FILE="/etc/net-optimize/config"
+
+# 配置文件只 source 一次，后续所有块共用已设置的变量
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
 if [ -f "$MODULES_FILE" ]; then
   while IFS= read -r module; do
     [ -n "$module" ] && modprobe "$module" 2>/dev/null || true
@@ -2070,10 +2041,6 @@ fi
 sysctl -e --system >/dev/null 2>&1 || true
 
 # === 强制覆盖 rp_filter（防止 cloud-init/systemd-networkd 按接口覆盖）===
-CONFIG_FILE="/etc/net-optimize/config"
-if [ -f "$CONFIG_FILE" ]; then
-  . "$CONFIG_FILE"
-fi
 _RP="${RP_FILTER:-2}"
 for _rp_path in /proc/sys/net/ipv4/conf/*/rp_filter; do
   echo "$_RP" > "$_rp_path" 2>/dev/null || true
@@ -2107,8 +2074,6 @@ fi
 # === 开机恢复 mangle POSTROUTING 规则（MSS + DSCP）===
 # 策略：先 flush 所有后端的 mangle POSTROUTING，再统一写入，彻底避免重复
 if [ -f "$CONFIG_FILE" ]; then
-  . "$CONFIG_FILE"
-
   IPT="${IPT_BACKEND:-iptables}"
   command -v "$IPT" >/dev/null 2>&1 || IPT="iptables"
   IFACE="${CLAMP_IFACE:-}"
@@ -2194,7 +2159,6 @@ if [ -f "$CONFIG_FILE" ]; then
   logger -t net-optimize "BOOT: add后 TCPMSS=$_post_add DSCP=$_post_ef"
 fi
 if [ -f "$CONFIG_FILE" ]; then
-  . "$CONFIG_FILE"
   _cwnd="${INITCWND:-20}"
   _strip_route_params() {
     echo "$1" | sed -E \
@@ -2224,7 +2188,6 @@ fi
 
 # === 游戏 QoS 恢复（cake / prio 双方案）===
 if [ -f "$CONFIG_FILE" ]; then
-  . "$CONFIG_FILE"
   _qos_scheme="${GAME_QOS_SCHEME:-none}"
   IFACE="${CLAMP_IFACE:-}"
 
@@ -2338,7 +2301,6 @@ fi
 
 # === 最终去重（兜底：清除所有后端中多余的 TCPMSS 和 DSCP 规则）===
 if [ -f "$CONFIG_FILE" ]; then
-  . "$CONFIG_FILE"
   _dedup_ipt="${IPT_BACKEND:-iptables}"
   command -v "$_dedup_ipt" >/dev/null 2>&1 || _dedup_ipt="iptables"
 
