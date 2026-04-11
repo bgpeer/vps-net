@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🔍 Net-Optimize 状态检测脚本 v1.5（配合 v3.6.0）
-# 新增：自适应 QoS 守护进程检测
+# 🔍 Net-Optimize 状态检测脚本 v1.6（配合 v3.7.0）
+# 新增：CPU 调频 / XPS / 中断合并 / MPTCP / WireGuard 检测
 # ==============================================================================
 set -euo pipefail
 
@@ -71,7 +71,7 @@ detect_iface() {
 IPT_CMD="$(detect_ipt_backend)"
 OUT_IFACE="$(detect_iface)"
 
-echo "🔍 开始系统状态检测（Net-Optimize v3.6.0）..."
+echo "🔍 开始系统状态检测（Net-Optimize v3.7.0）..."
 title
 
 # === [1] 网络优化关键状态 ===
@@ -91,11 +91,16 @@ green "✅ 默认队列：$qdisc"
 has_key net.ipv4.tcp_mtu_probing && green "✅ TCP MTU 探测：$(get net.ipv4.tcp_mtu_probing)"
 
 echo "✅ TCP 参数："
-echo "  🔹 tcp_window_scaling  = $(get net.ipv4.tcp_window_scaling)"
-echo "  🔹 tcp_sack            = $(get net.ipv4.tcp_sack)"
-echo "  🔹 tcp_notsent_lowat   = $(get net.ipv4.tcp_notsent_lowat)"
-echo "  🔹 tcp_no_metrics_save = $(get net.ipv4.tcp_no_metrics_save)"
-echo "  🔹 tcp_autocorking     = $(get net.ipv4.tcp_autocorking)"
+echo "  🔹 tcp_window_scaling        = $(get net.ipv4.tcp_window_scaling)"
+echo "  🔹 tcp_sack                  = $(get net.ipv4.tcp_sack)"
+echo "  🔹 tcp_notsent_lowat         = $(get net.ipv4.tcp_notsent_lowat)"
+echo "  🔹 tcp_no_metrics_save       = $(get net.ipv4.tcp_no_metrics_save)"
+echo "  🔹 tcp_autocorking           = $(get net.ipv4.tcp_autocorking)"
+echo "  🔹 tcp_thin_linear_timeouts  = $(get net.ipv4.tcp_thin_linear_timeouts)"
+echo "✅ 低延迟轮询："
+_bp="$(get net.core.busy_poll)"; _br="$(get net.core.busy_read)"
+[[ "$_bp" -gt 0 ]] 2>/dev/null && green "  ✅ busy_poll=$_bp μs  busy_read=$_br μs" \
+  || echo "  🔹 busy_poll=$_bp  busy_read=$_br（0=关闭）"
 echo "✅ UDP 缓冲："
 echo "  🔹 udp_rmem_min = $(get net.ipv4.udp_rmem_min)"
 echo "  🔹 udp_wmem_min = $(get net.ipv4.udp_wmem_min)"
@@ -103,10 +108,15 @@ echo "  🔹 udp_mem      = $(get net.ipv4.udp_mem)"
 echo "✅ TCP 缓冲："
 echo "  🔹 tcp_rmem = $(get net.ipv4.tcp_rmem)"
 echo "  🔹 tcp_wmem = $(get net.ipv4.tcp_wmem)"
-echo "✅ Core 缓冲："
+echo "  🔹 tcp_mem  = $(get net.ipv4.tcp_mem)"
+echo "✅ Core 缓冲（内存自适应）："
+_rmem_max="$(get net.core.rmem_max)"
+_mem_total_mb="$(awk '/^MemTotal:/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo '?')"
+echo "  🔹 系统内存: ${_mem_total_mb} MB"
 echo "  🔹 rmem_default = $(get net.core.rmem_default)"
 echo "  🔹 wmem_default = $(get net.core.wmem_default)"
-echo "  🔹 rmem_max     = $(get net.core.rmem_max)"
+[[ "$_rmem_max" -ge 134217728 ]] 2>/dev/null && green "  ✅ rmem_max = $_rmem_max（≥128MB）" \
+  || echo "  🔹 rmem_max = $_rmem_max"
 echo "  🔹 wmem_max     = $(get net.core.wmem_max)"
 echo "  🔹 netdev_max_backlog = $(get net.core.netdev_max_backlog)"
 
@@ -151,10 +161,86 @@ if [[ -n "$OUT_IFACE" ]]; then
 
   has tc && { _tc="$(tc qdisc show dev "$OUT_IFACE" root 2>/dev/null | awk '{print $2}' | head -n1 || true)"; [[ -n "$_tc" ]] && echo "  🔹 tc qdisc: $_tc"; }
 
+  # XPS
+  _xps_mask=""
+  for _txq in /sys/class/net/"$OUT_IFACE"/queues/tx-*/xps_cpus; do
+    [[ -f "$_txq" ]] && _xps_mask="$(cat "$_txq" 2>/dev/null || true)" && break
+  done
+  [[ -n "$_xps_mask" && "$_xps_mask" != "0" && "$_xps_mask" != "00000000" ]] \
+    && green "  ✅ XPS 掩码: $_xps_mask" || echo "  🔹 XPS: 未启用或单队列网卡"
+
+  # 网卡中断合并
+  if has ethtool; then
+    _coal="$(ethtool -c "$OUT_IFACE" 2>/dev/null || true)"
+    if [[ -n "$_coal" ]]; then
+      _adaptive_rx="$(echo "$_coal" | awk '/Adaptive RX:/{print $3}')"
+      _rx_usecs="$(echo "$_coal" | awk '/^rx-usecs:/{print $2}')"
+      if [[ "$_adaptive_rx" == "on" ]]; then
+        green "  ✅ 中断合并: adaptive-rx on，rx-usecs=$_rx_usecs"
+      else
+        echo "  🔹 中断合并: adaptive-rx=off，rx-usecs=$_rx_usecs"
+      fi
+    else
+      echo "  🔹 中断合并: 网卡不支持查询"
+    fi
+  fi
+
+  # WireGuard
+  if ip link show type wireguard >/dev/null 2>&1; then
+    _wg_ifaces="$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | tr '\n' ' ')"
+    green "  ✅ WireGuard 接口: $_wg_ifaces"
+    _ugro="$(ethtool -k "$OUT_IFACE" 2>/dev/null | awk '/rx-udp-gro-forwarding:/{print $2}' || true)"
+    [[ "$_ugro" == "on" ]] \
+      && green "  ✅ UDP GRO 转发: on（WireGuard CPU 优化已生效）" \
+      || echo "  🔹 UDP GRO 转发: ${_ugro:-不支持}（rx-udp-gro-forwarding）"
+  else
+    echo "  🔹 WireGuard: 未检测到接口"
+  fi
+
   [[ -f /etc/udev/rules.d/99-net-optimize-offload.rules ]] && green "  ✅ offload 持久化已配置"
-  [[ -f /etc/tmpfiles.d/net-optimize-rps.conf ]] && green "  ✅ RPS/RFS 持久化已配置"
+  [[ -f /etc/tmpfiles.d/net-optimize-rps.conf ]] && green "  ✅ RPS/RFS/XPS 持久化已配置"
 else
   yellow "  ⚠️ 无法检测出口网卡"
+fi
+
+# === [2b] CPU 调频 ===
+sep
+echo "⚡ [2b] CPU 调频策略"
+sep
+_gov_files=(/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor)
+if [[ -f "${_gov_files[0]}" ]]; then
+  _perf_cnt=0; _total_cnt=0; _gov_list=""
+  for _gf in "${_gov_files[@]}"; do
+    [[ -f "$_gf" ]] || continue
+    _total_cnt=$((_total_cnt + 1))
+    _g="$(cat "$_gf" 2>/dev/null || true)"
+    [[ "$_g" == "performance" ]] && _perf_cnt=$((_perf_cnt + 1))
+    _gov_list="$_g"  # 记录最后一个，通常全部相同
+  done
+  if [[ "$_perf_cnt" -eq "$_total_cnt" ]]; then
+    green "  ✅ CPU 调频: performance（${_total_cnt} 核全部）"
+  else
+    yellow "  ⚠️ CPU 调频: $_gov_list（${_perf_cnt}/${_total_cnt} 核为 performance）"
+  fi
+  [[ -f /etc/tmpfiles.d/net-optimize-cpufreq.conf ]] \
+    && green "  ✅ CPU 调频持久化已配置" \
+    || echo "  🔹 CPU 调频持久化未配置"
+else
+  echo "  ℹ️ CPU 调频: 不支持（容器/虚拟化环境）"
+fi
+
+# === [2c] MPTCP ===
+sep
+echo "🔀 [2c] MPTCP 多路径传输"
+sep
+if sysctl net.mptcp.enabled >/dev/null 2>&1; then
+  _mptcp="$(sysctl -n net.mptcp.enabled 2>/dev/null || echo 0)"
+  [[ "$_mptcp" == "1" ]] && green "  ✅ MPTCP: 已启用" || yellow "  ⚠️ MPTCP: 已安装但未启用"
+  [[ -f /etc/sysctl.d/98-net-optimize-mptcp.conf ]] \
+    && green "  ✅ MPTCP 持久化已配置" \
+    || echo "  🔹 MPTCP 持久化未配置"
+else
+  echo "  ℹ️ MPTCP: 内核不支持（需要 5.6+）"
 fi
 
 # === [3] 游戏 QoS 状态 ===
@@ -239,7 +325,7 @@ else
   if [[ "$_aggressive" -eq 1 ]]; then
     echo "  ℹ️ 游戏 QoS 未启用（激进模式下互斥）"
   else
-    echo "  ℹ️ 游戏 QoS 未启用（ENABLE_GAME_QOS=0 或未运行 v3.6.0+）"
+    echo "  ℹ️ 游戏 QoS 未启用（ENABLE_GAME_QOS=0 或未运行 v3.7.0+）"
   fi
 fi
 
@@ -372,7 +458,7 @@ OVERRIDE_FILE="/etc/sysctl.d/zzz-net-optimize-override.conf"
 
 if [[ -f "$SYSCTL_FILE" ]]; then
   echo "  关键项对比："
-  for k in net.core.default_qdisc net.ipv4.tcp_congestion_control net.ipv4.tcp_window_scaling net.ipv4.tcp_sack net.core.rmem_max net.core.wmem_max net.ipv4.conf.all.rp_filter net.netfilter.nf_conntrack_max; do
+  for k in net.core.default_qdisc net.ipv4.tcp_congestion_control net.ipv4.tcp_window_scaling net.ipv4.tcp_sack net.core.rmem_max net.core.wmem_max net.ipv4.conf.all.rp_filter net.netfilter.nf_conntrack_max net.core.busy_poll net.ipv4.tcp_thin_linear_timeouts net.ipv4.tcp_max_tw_buckets; do
     rt="$(get "$k")"
     fv="$(awk -v kk="$k" '$0 ~ "^[[:space:]]*#" {next} $1 == kk && $2 == "=" {sub("^[^=]*=[[:space:]]*", "", $0); gsub(/[[:space:]]+$/, "", $0); print $0}' "$SYSCTL_FILE" 2>/dev/null | tail -n1)"
     fv="${fv:-N/A}"
@@ -426,7 +512,10 @@ else
   printf "  %-10s: %s\n" "可用" "N/A"
 fi
 printf "  %-10s: %s\n" "运行" "$(uptime -p 2>/dev/null || echo '?')"
-[[ -f /usr/local/sbin/net-optimize-ultimate.sh ]] && green "✅ 脚本版本：$(grep -oP 'v\d+\.\d+\.\d+' /usr/local/sbin/net-optimize-ultimate.sh | head -n1)"
+if [[ -f /usr/local/sbin/net-optimize-ultimate.sh ]]; then
+  _ver="$(grep -oP 'v\d+\.\d+\.\d+' /usr/local/sbin/net-optimize-ultimate.sh | head -n1)"
+  [[ "$_ver" == "v3.7.0" ]] && green "✅ 脚本版本：$_ver" || yellow "⚠️ 脚本版本：$_ver（建议升级到 v3.7.0）"
+fi
 [[ -n "$IPT_CMD" ]] && echo "  ℹ️ iptables 后端：$IPT_CMD"
 [[ -n "$OUT_IFACE" ]] && echo "  ℹ️ 出口网卡：$OUT_IFACE"
 
