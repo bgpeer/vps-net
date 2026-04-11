@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.6.0
+# 🚀 Net-Optimize-Ultimate v3.7.0
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
+# v3.7.0 新增：
+#   1) BBRv2/BBRv3 自动检测（内核支持时优先启用）
+#   2) CPU 调频策略自动切换 performance（降低包处理延迟）
+#   3) XPS 发送端包分发（配合 RPS，减少跨核锁竞争）
+#   4) 网卡中断合并自适应调优（ethtool adaptive coalescing）
+#   5) 基于实际内存动态计算缓冲区大小（告别硬编码 64MB）
+#   6) tcp_mem 动态计算（防止低内存 VPS 触发 TCP 内存压力）
+#   7) TCP thin stream 优化（游戏/交互式连接减少重传等待）
+#   8) MPTCP 自动启用（内核 5.6+）
+#   9) WireGuard 检测 + UDP GRO 转发优化
 # v3.6.0 新增：
 #   1) 游戏低延迟 QoS（cake diffserv4 优先，fallback prio+fq_codel）
 #   2) 游戏 DSCP 标记（UDP 小包 ≤200B 非 443 → AF41 低延迟档）
@@ -95,7 +105,7 @@ install -Dm755 "$0" "$SCRIPT_PATH" 2>/dev/null || true
 
 trap 'code=$?; echo "❌ 出错：第 ${BASH_LINENO[0]} 行 -> ${BASH_COMMAND} (退出码 $code)"; exit $code' ERR
 
-echo "🚀 Net-Optimize-Ultimate v3.6.0 开始执行..."
+echo "🚀 Net-Optimize-Ultimate v3.7.0 开始执行..."
 echo "========================================================"
 
 # === 2. 全局配置开关 ===
@@ -120,6 +130,12 @@ echo "========================================================"
 : "${ADAPTIVE_QOS:=1}"         # 自适应 QoS：流量高→抢带宽，流量低→游戏低延迟（自动切换）
 : "${ADAPTIVE_QOS_THRESHOLD:=1048576}"  # 自适应阈值（字节/秒，默认 1MB/s）
 : "${ADAPTIVE_QOS_INTERVAL:=2}"         # 采样间隔（秒）
+: "${ENABLE_CPU_GOVERNOR:=1}"           # CPU 调频切换到 performance 模式
+: "${ENABLE_XPS:=1}"                    # XPS 发送端包分发（配合 RPS）
+: "${ENABLE_IRQ_COALESCING:=1}"         # 网卡中断合并自适应调优
+: "${ENABLE_MPTCP:=1}"                  # MPTCP 多路径传输（内核 5.6+）
+: "${ENABLE_WG_OPT:=1}"                 # WireGuard UDP GRO 转发优化
+: "${RAM_ADAPTIVE_BUFFERS:=1}"          # 基于实际内存动态计算缓冲区大小
 
 # 路径定义
 CONFIG_DIR="/etc/net-optimize"
@@ -555,7 +571,12 @@ setup_tcp_congestion() {
   local available_cc
   available_cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo cubic)"
 
-  if echo "$available_cc" | grep -qw bbrplus; then
+  # 优先级：bbr3 > bbr2 > bbrplus > bbr > cubic
+  if echo "$available_cc" | grep -qw bbr3; then
+    target_cc="bbr3"
+  elif echo "$available_cc" | grep -qw bbr2; then
+    target_cc="bbr2"
+  elif echo "$available_cc" | grep -qw bbrplus; then
     target_cc="bbrplus"
   elif echo "$available_cc" | grep -qw bbr; then
     target_cc="bbr"
@@ -582,13 +603,43 @@ write_sysctl_conf() {
   local sysctl_file="$SYSCTL_AUTH_FILE"
   install -d /etc/sysctl.d
 
+  # --- 动态计算缓冲区大小（基于实际物理内存）---
+  local total_ram_kb rmem_max wmem_max rmem_default wmem_default
+  total_ram_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 1048576)"
+  if [ "${RAM_ADAPTIVE_BUFFERS:-1}" = "1" ]; then
+    if   [ "$total_ram_kb" -ge 8000000 ]; then
+      rmem_max=268435456; wmem_max=268435456    # ≥8GB: 256MB
+    elif [ "$total_ram_kb" -ge 4000000 ]; then
+      rmem_max=134217728; wmem_max=134217728    # ≥4GB: 128MB
+    elif [ "$total_ram_kb" -ge 2000000 ]; then
+      rmem_max=67108864;  wmem_max=67108864     # ≥2GB: 64MB
+    else
+      rmem_max=33554432;  wmem_max=33554432     # <2GB: 32MB
+    fi
+  else
+    rmem_max=67108864; wmem_max=67108864
+  fi
+  rmem_default=262144; wmem_default=262144
+
+  # tcp_mem: min/pressure/max（单位：页，4KB/页）
+  # 分别取 RAM 的 1/32、1/8、1/4，并设上下限
+  local pages_per_kb=1  # 4KB page = 1 page per 4KB = 0.25 page per KB
+  local tcp_mem_min tcp_mem_pressure tcp_mem_max
+  tcp_mem_min=$(( total_ram_kb / 4 / 32 ))
+  tcp_mem_pressure=$(( total_ram_kb / 4 / 8 ))
+  tcp_mem_max=$(( total_ram_kb / 4 / 4 ))
+  # 下限保护
+  [ "$tcp_mem_min" -lt 8192  ] && tcp_mem_min=8192
+  [ "$tcp_mem_pressure" -lt 32768 ] && tcp_mem_pressure=32768
+  [ "$tcp_mem_max" -lt 65536 ] && tcp_mem_max=65536
+
   local cc qdisc
   cc="${FINAL_CC:-$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic)}"
   qdisc="${FINAL_QDISC:-$(sysctl -n net.core.default_qdisc 2>/dev/null || echo fq)}"
 
   {
     echo "# ========================================================="
-    echo "# 🚀 Net-Optimize Ultimate v3.6.0 - Kernel Parameters"
+    echo "# 🚀 Net-Optimize Ultimate v3.7.0 - Kernel Parameters"
     echo "# Generated: $(date -u '+%F %T UTC')"
     echo "# ========================================================="
     echo
@@ -635,21 +686,28 @@ write_sysctl_conf() {
     echo "net.ipv4.tcp_retries2 = 5"
     echo "net.ipv4.tcp_synack_retries = 1"
     echo "net.ipv4.tcp_early_retrans = 3"
+    echo "net.ipv4.tcp_thin_linear_timeouts = 1"  # 游戏/交互小包流：线性重传替代指数退避
+    echo
+    echo "# === 低延迟轮询（代理/游戏服务器降低响应延迟）==="
+    echo "net.core.busy_poll = 50"    # socket poll 忙等 50μs，减少中断唤醒延迟
+    echo "net.core.busy_read = 50"    # socket read 忙等 50μs
     echo
     # 注：tcp_low_latency 在 4.14+ 已移除；tcp_fack / tcp_frto 在 BBR 下无实际作用
     # 不再写入，避免 sysctl -e 报 unknown key 警告
 
-    echo "# === 内存缓冲区优化（max=64MB，default=256KB 让 TCP autotuning 自行扩展）==="
-    echo "net.core.rmem_max = 67108864"
-    echo "net.core.wmem_max = 67108864"
-    echo "net.core.rmem_default = 262144"
-    echo "net.core.wmem_default = 262144"
+    echo "# === 内存缓冲区优化（基于物理内存动态计算，default=256KB 让 TCP autotuning 自行扩展）==="
+    echo "# 当前系统内存: $((total_ram_kb / 1024)) MB → rmem/wmem_max = $((rmem_max / 1024 / 1024)) MB"
+    echo "net.core.rmem_max = $rmem_max"
+    echo "net.core.wmem_max = $wmem_max"
+    echo "net.core.rmem_default = $rmem_default"
+    echo "net.core.wmem_default = $wmem_default"
     echo "net.core.optmem_max = 65536"
-    echo "net.ipv4.tcp_rmem = 4096 87380 67108864"
-    echo "net.ipv4.tcp_wmem = 4096 65536 67108864"
+    echo "net.ipv4.tcp_rmem = 4096 87380 $rmem_max"
+    echo "net.ipv4.tcp_wmem = 4096 65536 $wmem_max"
     echo "net.ipv4.udp_rmem_min = 16384"
     echo "net.ipv4.udp_wmem_min = 16384"
-    echo "net.ipv4.udp_mem = 65536 131072 262144"
+    echo "net.ipv4.udp_mem = $tcp_mem_min $tcp_mem_pressure $tcp_mem_max"
+    echo "net.ipv4.tcp_mem = $tcp_mem_min $tcp_mem_pressure $tcp_mem_max"
     echo
 
     if [ "$AGGRESSIVE_MODE" = "1" ]; then
@@ -867,6 +925,36 @@ setup_nic_offload() {
   } > "$udev_file"
   chmod 644 "$udev_file"
   echo "  ✅ offload 持久化：$udev_file"
+
+  # === 自适应中断合并（降低延迟，平衡吞吐）===
+  if [ "${ENABLE_IRQ_COALESCING:-1}" = "1" ]; then
+    # 优先开启自适应模式；若网卡不支持，退回手动设置 50μs
+    if ethtool -C "$iface" adaptive-rx on adaptive-tx on 2>/dev/null; then
+      echo "  ✅ 中断合并：自适应模式已开启（adaptive-rx/tx on）"
+    else
+      ethtool -C "$iface" rx-usecs 50 tx-usecs 50 2>/dev/null \
+        && echo "  ✅ 中断合并：固定 50μs (rx/tx-usecs)" \
+        || echo "  ℹ️ 中断合并：网卡不支持，已跳过"
+    fi
+  fi
+
+  # === WireGuard UDP GRO 转发（降低 WG 中转 CPU 占用）===
+  if [ "${ENABLE_WG_OPT:-1}" = "1" ]; then
+    if ip link show type wireguard >/dev/null 2>&1; then
+      # 开启出口网卡的 UDP GRO 转发，让内核合并 WG UDP 包再转发
+      ethtool -K "$iface" rx-udp-gro-forwarding on 2>/dev/null \
+        && echo "  ✅ WireGuard UDP GRO 转发已开启（$iface）" \
+        || echo "  ℹ️ WireGuard UDP GRO 转发：网卡不支持或内核版本不足，已跳过"
+      # 对每个 WG 接口也开启 rx-udp-gro-forwarding
+      local wg_iface
+      while IFS= read -r wg_iface; do
+        [ -z "$wg_iface" ] && continue
+        ethtool -K "$wg_iface" rx-udp-gro-forwarding on 2>/dev/null || true
+      done < <(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}')
+    else
+      echo "  ℹ️ 未检测到 WireGuard 接口，跳过 UDP GRO 转发"
+    fi
+  fi
 }
 
 # === 9.6 RPS/RFS 多核收包均衡 ===
@@ -926,6 +1014,26 @@ setup_rps_rfs() {
   } > "$tmpfiles_conf"
   chmod 644 "$tmpfiles_conf"
   echo "  ✅ RPS/RFS 持久化：$tmpfiles_conf"
+
+  # === XPS（Transmit Packet Steering）===
+  # 让发包也绑定到 CPU，与 RPS 配合减少跨核锁竞争
+  if [ "${ENABLE_XPS:-1}" = "1" ]; then
+    local xps_applied=0
+    local tx_queue_dir
+    for tx_queue_dir in /sys/class/net/"$iface"/queues/tx-*/xps_cpus; do
+      [ -f "$tx_queue_dir" ] || continue
+      echo "$cpu_mask" > "$tx_queue_dir" 2>/dev/null && xps_applied=$((xps_applied + 1)) || true
+    done
+    if [ "$xps_applied" -gt 0 ]; then
+      echo "  ✅ XPS 已配置：$xps_applied 个 TX 队列绑定掩码=$cpu_mask"
+      # 追加到 tmpfiles 持久化
+      for tx_queue_dir in /sys/class/net/"$iface"/queues/tx-*/xps_cpus; do
+        [ -f "$tx_queue_dir" ] && echo "w $tx_queue_dir - - - - $cpu_mask" >> "$tmpfiles_conf"
+      done
+    else
+      echo "  ℹ️ XPS：未发现可配置的 TX 队列（单队列网卡或不支持）"
+    fi
+  fi
 }
 
 # === 9.7 QUIC/UDP DSCP 优先级标记 ===
@@ -1011,6 +1119,84 @@ setup_dscp_marking() {
   fi
 
   echo "  ✅ UDP 443 (QUIC) DSCP=EF 已标记（$ipt_backend）"
+}
+
+# === 9.8b CPU 调频策略优化 ===
+setup_cpu_governor() {
+  if [ "${ENABLE_CPU_GOVERNOR:-1}" != "1" ]; then
+    echo "⏭️ 跳过 CPU 调频优化"
+    return 0
+  fi
+
+  echo "⚡ CPU 调频策略优化（performance 模式）..."
+
+  local changed=0 total=0
+  local gov_file
+  for gov_file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -f "$gov_file" ] || continue
+    total=$((total + 1))
+    local current
+    current="$(cat "$gov_file" 2>/dev/null || true)"
+    if [ "$current" != "performance" ]; then
+      echo "performance" > "$gov_file" 2>/dev/null && changed=$((changed + 1)) || true
+    fi
+  done
+
+  if [ "$total" -eq 0 ]; then
+    echo "  ℹ️ 未发现 cpufreq 接口（容器/虚拟化环境不支持，已跳过）"
+    return 0
+  fi
+
+  if [ "$changed" -gt 0 ]; then
+    echo "  ✅ $changed/$total 个 CPU 核心已切换到 performance 模式"
+  else
+    echo "  ✅ CPU 调频已是 performance 模式（$total 核心，无需变更）"
+  fi
+
+  # 持久化：写入 cpupower / systemd-tmpfiles（双保险）
+  if have_cmd cpupower; then
+    cpupower frequency-set -g performance >/dev/null 2>&1 || true
+  fi
+  # tmpfiles 持久化
+  local cpufreq_tmpfiles="/etc/tmpfiles.d/net-optimize-cpufreq.conf"
+  {
+    echo "# Net-Optimize: CPU performance governor"
+    for gov_file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+      [ -f "$gov_file" ] && echo "w $gov_file - - - - performance"
+    done
+  } > "$cpufreq_tmpfiles"
+  chmod 644 "$cpufreq_tmpfiles"
+  echo "  ✅ CPU 调频持久化：$cpufreq_tmpfiles"
+}
+
+# === 9.8c MPTCP 多路径传输（内核 5.6+）===
+setup_mptcp() {
+  if [ "${ENABLE_MPTCP:-1}" != "1" ]; then
+    echo "⏭️ 跳过 MPTCP 配置"
+    return 0
+  fi
+
+  echo "🔀 MPTCP 多路径传输检测..."
+
+  # 检测内核是否支持 MPTCP
+  if ! sysctl net.mptcp.enabled >/dev/null 2>&1; then
+    echo "  ℹ️ 内核不支持 MPTCP（需要 5.6+），已跳过"
+    return 0
+  fi
+
+  sysctl -w net.mptcp.enabled=1 >/dev/null 2>&1 || true
+  local mptcp_state
+  mptcp_state="$(sysctl -n net.mptcp.enabled 2>/dev/null || echo 0)"
+
+  if [ "$mptcp_state" = "1" ]; then
+    echo "  ✅ MPTCP 已启用"
+    # 写入 sysctl 持久化文件
+    local mptcp_conf="/etc/sysctl.d/98-net-optimize-mptcp.conf"
+    echo "net.mptcp.enabled = 1" > "$mptcp_conf"
+    chmod 644 "$mptcp_conf"
+  else
+    echo "  ⚠️ MPTCP 启用失败（可能被内核编译选项禁用）"
+  fi
 }
 
 # === 9.8 自动检测线路质量 + initcwnd 调整 ===
@@ -2352,7 +2538,7 @@ _final_ef="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c
 _final_af41="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x22' || true)"
 logger -t net-optimize "BOOT: 最终 TCPMSS=$_final_tcpmss EF=$_final_ef AF41=$_final_af41"
 
-echo "[$(date)] Net-Optimize v3.6.0 开机优化完成"
+echo "[$(date)] Net-Optimize v3.7.0 开机优化完成"
 APPLYEOF
 
   chmod +x "$APPLY_SCRIPT"
@@ -2532,7 +2718,7 @@ print_status() {
 main() {
   require_root
 
-  echo "🚀 Net-Optimize-Ultimate v3.6.0 启动..."
+  echo "🚀 Net-Optimize-Ultimate v3.7.0 启动..."
   echo "========================================================"
 
   clean_old_config
@@ -2545,6 +2731,8 @@ main() {
   setup_conntrack
   setup_nic_offload
   setup_rps_rfs
+  setup_cpu_governor
+  setup_mptcp
   setup_mss_clamping
   setup_dscp_marking
   setup_initcwnd
@@ -2559,10 +2747,11 @@ main() {
   echo "✅ 所有优化配置完成！"
   echo ""
   echo "📌 重要提示："
-  echo "  1. 64MB缓冲区需要重启后完全生效"
+  echo "  1. 缓冲区大小已按内存自动计算，重启后完全生效"
   echo "  2. 检查状态: systemctl status net-optimize"
   echo "  3. 查看连接: cat /proc/net/nf_conntrack | head -20"
   echo "  4. 验证MSS: iptables -t mangle -L -n -v"
+  echo "  5. 查看 CPU 调频: cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
   echo ""
 
   if [ -t 0 ]; then
