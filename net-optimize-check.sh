@@ -187,12 +187,16 @@ if [[ -n "$OUT_IFACE" ]]; then
 
   # WireGuard
   if ip link show type wireguard >/dev/null 2>&1; then
-    _wg_ifaces="$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | tr '\n' ' ')"
-    green "  ✅ WireGuard 接口: $_wg_ifaces"
-    _ugro="$(ethtool -k "$OUT_IFACE" 2>/dev/null | awk '/rx-udp-gro-forwarding:/{print $2}' || true)"
-    [[ "$_ugro" == "on" ]] \
-      && green "  ✅ UDP GRO 转发: on（WireGuard CPU 优化已生效）" \
-      || echo "  🔹 UDP GRO 转发: ${_ugro:-不支持}（rx-udp-gro-forwarding）"
+    _wg_ifaces="$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | tr '\n' ' ' | xargs)"
+    if [[ -n "$_wg_ifaces" ]]; then
+      green "  ✅ WireGuard 接口: $_wg_ifaces"
+      _ugro="$(ethtool -k "$OUT_IFACE" 2>/dev/null | awk '/rx-udp-gro-forwarding:/{print $2}' || true)"
+      [[ "$_ugro" == "on" ]] \
+        && green "  ✅ UDP GRO 转发: on（WireGuard CPU 优化已生效）" \
+        || echo "  🔹 UDP GRO 转发: ${_ugro:-不支持}（rx-udp-gro-forwarding）"
+    else
+      echo "  🔹 WireGuard: 内核模块已加载，但无活跃接口"
+    fi
   else
     echo "  🔹 WireGuard: 未检测到接口"
   fi
