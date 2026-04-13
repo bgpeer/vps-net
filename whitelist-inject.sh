@@ -1,6 +1,6 @@
 #!/bin/bash
-# whitelist-inject.sh v1.2
-# 在 v2ray-agent sing-box 屏蔽中国域名规则前注入白名单放行规则
+# whitelist-inject.sh v1.3
+# 在 v2ray-agent sing-box 屏蔽中国域名/IP 规则前注入白名单放行规则
 # 用法: bash whitelist-inject.sh
 # 注意: 每次 vasma 修改配置后需重新执行
 
@@ -57,14 +57,17 @@ CLEAN=$(jq '
   .route.rule_set = [.route.rule_set[] | select(.tag | startswith("whitelist-") | not)] |
   .route.rules = [.route.rules[] | select(
     if .rule_set then
-      (.rule_set | if type == "array" then any(startswith("whitelist-")) else startswith("whitelist-") end) | not
+      (if (.rule_set | type) == "array"
+       then (.rule_set | any(startswith("whitelist-"))) | not
+       else (.rule_set | startswith("whitelist-")) | not
+       end)
     else true end
   )]
 ' "$CONFIG")
 
 echo "$CLEAN" > "$CONFIG"
 
-# 构建 rule_set 条目 JSON（与现有 cn_cn_block_route 格式一致）
+# 构建 rule_set 条目 JSON
 RULE_SET_JSON="[]"
 for tag in "${WHITELIST_TAGS[@]}"; do
   RULE_SET_JSON=$(echo "$RULE_SET_JSON" | jq \
@@ -84,16 +87,26 @@ for tag in "${WHITELIST_TAGS[@]}"; do
   REFS_JSON=$(echo "$REFS_JSON" | jq --arg t "whitelist-${tag}" '. + [$t]')
 done
 
-# 注入：rule_set 追加定义，rules 中在 cn_block 规则前插入白名单
+# 注入：
+# 找到 geoip 封锁 或 cn_block 规则中最靠前的位置，在其前面插入白名单
+# 这样白名单优先于 IP 封锁和域名封锁两道规则
 jq --argjson rsets "$RULE_SET_JSON" \
    --argjson refs "$REFS_JSON" \
    '
    # 追加 rule_set 定义
    .route.rule_set += $rsets |
 
-   # 找到 cn_block 规则的位置，在其前面插入白名单
+   # 找到第一个封锁规则（geoip 或 cn_block），在其前面插入白名单
    .route.rules as $rules |
-   ($rules | to_entries | map(select(.value.rule_set? == "cn_cn_block_route")) | .[0].key // 1) as $idx |
+   (
+     $rules | to_entries | map(select(
+       .value.rule_set? == "cn_cn_block_route" or
+       .value.rule_set? == "geoip_cn_cn_block_ip_route" or
+       ((.value.rule_set? | type) == "array" and (
+         .value.rule_set | any(. == "cn_cn_block_route" or . == "geoip_cn_cn_block_ip_route")
+       ))
+     )) | .[0].key // 1
+   ) as $idx |
    .route.rules = ($rules[:$idx] + [{"rule_set": $refs, "outbound": "01_direct_outbound"}] + $rules[$idx:])
    ' "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
 
@@ -102,7 +115,16 @@ echo "[完成] 白名单注入成功！"
 echo "放行标签: ${WHITELIST_TAGS[*]}"
 echo ""
 echo "当前路由规则顺序:"
-jq -r '.route.rules[] | if .rule_set then "  → rule_set: \(.rule_set) → \(.outbound)" elif .domain_regex then "  → domain_regex → \(.outbound)" elif .action then "  → action: \(.action)" else "  → \(.)" end' "$CONFIG"
+jq -r '.route.rules[] |
+  if .rule_set then
+    "  → rule_set: \(if (.rule_set|type)=="array" then (.rule_set|join(",")) else .rule_set end) → \(.outbound)"
+  elif .domain_regex then
+    "  → domain_regex (\(.domain_regex|length) 条) → \(.outbound)"
+  elif .action then
+    "  → action: \(.action)"
+  else
+    "  → \(.)"
+  end' "$CONFIG"
 echo ""
 
 # 校验配置
@@ -121,7 +143,7 @@ echo "[信息] 配置校验通过"
 echo "[信息] 重启 sing-box..."
 systemctl restart sing-box
 
-# 等待 sing-box 启动完成（最长等 60 秒）
+# 等待 sing-box 启动（最长 60 秒）
 echo "[信息] 等待 sing-box 启动..."
 for i in $(seq 1 30); do
   sleep 2
