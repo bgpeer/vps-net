@@ -81,6 +81,11 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-
 ```
 代码跑完之后建议把所有的连接信息复制下来保存到**谷歌文档**，方便以后提取
 
+# 如果创建了屏蔽大陆域名，下面是放行白名单规则集脚本
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelist-inject.sh)
+```
+
 ---
 
 # 📱 ClashMeta/Clash Mi可直接提取的 10 协议模板，只支持mihomo核心（移动端可用）
