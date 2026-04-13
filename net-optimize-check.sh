@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🔍 Net-Optimize 状态检测脚本 v1.6（配合 v3.7.0）
+# 🔍 Net-Optimize 状态检测脚本 v1.7（配合 v3.7.1）
 # 新增：CPU 调频 / XPS / 中断合并 / MPTCP / WireGuard 检测
 # ==============================================================================
 set -euo pipefail
@@ -71,7 +71,7 @@ detect_iface() {
 IPT_CMD="$(detect_ipt_backend)"
 OUT_IFACE="$(detect_iface)"
 
-echo "🔍 开始系统状态检测（Net-Optimize v3.7.0）..."
+echo "🔍 开始系统状态检测（Net-Optimize v3.7.1）..."
 title
 
 # === [1] 网络优化关键状态 ===
@@ -271,11 +271,13 @@ if [[ "$_adaptive_active" -eq 1 ]]; then
     _aq_interval="$(python3 -c "import json;c=json.load(open('/etc/net-optimize/adaptive-qos.conf'));print(c.get('interval',2))" 2>/dev/null || true)"
     _aq_has_length="$(python3 -c "import json;c=json.load(open('/etc/net-optimize/adaptive-qos.conf'));print(c.get('has_length',False))" 2>/dev/null || true)"
   fi
+  _aq_cooldown="$(python3 -c "import json;c=json.load(open('/etc/net-optimize/adaptive-qos.conf'));print(c.get('cooldown',10))" 2>/dev/null || true)"
   _aq_threshold="${_aq_threshold:-1048576}"
   _aq_interval="${_aq_interval:-2}"
-  echo "    → 阈值: $(( _aq_threshold / 1024 )) KB/s  采样: ${_aq_interval}s"
-  echo "    → 流量 ≥ 阈值 → pfifo_fast（抢带宽）"
-  echo "    → 流量 < 阈值 → cake/prio（游戏低延迟）"
+  _aq_cooldown="${_aq_cooldown:-10}"
+  echo "    → 阈值: $(( _aq_threshold / 1024 )) KB/s  采样: ${_aq_interval}s  冷却: ${_aq_cooldown}s"
+  echo "    → 流量 ≥ 阈值（入站或出站）→ pfifo_fast（抢带宽）"
+  echo "    → 流量 < 阈值 持续 ${_aq_cooldown}s → cake/prio（游戏低延迟）"
   [[ "${_aq_has_length:-}" == "False" ]] && yellow "    → ⚠️ -m length 不可用，AF41 标记已跳过"
 
   # 检测当前实际 qdisc 判断当前处于哪个模式
@@ -289,10 +291,10 @@ if [[ "$_adaptive_active" -eq 1 ]]; then
     esac
   fi
 
-  # 最近切换日志
-  _recent_switch="$(journalctl -t adaptive-qos --no-pager -n 3 --output=short-iso 2>/dev/null || true)"
+  # 最近切换日志（北京时间 UTC+8）
+  _recent_switch="$(TZ='Asia/Shanghai' journalctl -t adaptive-qos --no-pager -n 3 --output=short-iso 2>/dev/null || true)"
   if [[ -n "$_recent_switch" ]]; then
-    echo "    → 最近切换日志:"
+    echo "    → 最近切换日志（北京时间）:"
     echo "$_recent_switch" | sed 's/^/      /'
   fi
 elif [[ "$_qos_scheme" == "cake" ]]; then
@@ -329,7 +331,7 @@ else
   if [[ "$_aggressive" -eq 1 ]]; then
     echo "  ℹ️ 游戏 QoS 未启用（激进模式下互斥）"
   else
-    echo "  ℹ️ 游戏 QoS 未启用（ENABLE_GAME_QOS=0 或未运行 v3.7.0+）"
+    echo "  ℹ️ 游戏 QoS 未启用（ENABLE_GAME_QOS=0 或未运行 v3.7.1+）"
   fi
 fi
 
@@ -518,7 +520,7 @@ fi
 printf "  %-10s: %s\n" "运行" "$(uptime -p 2>/dev/null || echo '?')"
 if [[ -f /usr/local/sbin/net-optimize-ultimate.sh ]]; then
   _ver="$(grep -oP 'v\d+\.\d+\.\d+' /usr/local/sbin/net-optimize-ultimate.sh | head -n1)"
-  [[ "$_ver" == "v3.7.0" ]] && green "✅ 脚本版本：$_ver" || yellow "⚠️ 脚本版本：$_ver（建议升级到 v3.7.0）"
+  [[ "$_ver" == "v3.7.1" ]] && green "✅ 脚本版本：$_ver" || yellow "⚠️ 脚本版本：$_ver（建议升级到 v3.7.1）"
 fi
 [[ -n "$IPT_CMD" ]] && echo "  ℹ️ iptables 后端：$IPT_CMD"
 [[ -n "$OUT_IFACE" ]] && echo "  ℹ️ 出口网卡：$OUT_IFACE"
