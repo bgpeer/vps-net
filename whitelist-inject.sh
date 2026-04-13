@@ -10,13 +10,14 @@ BACKUP="${CONFIG}.bak.$(date +%s)"
 
 # ===== 白名单规则集（按需增减，对应 .srs 文件名）=====
 WHITELIST_TAGS=(
-  "wechat"
   "douyin"
+  "wildrift"
   "bilibili"
   "zhihu"
   "xiaohongshu"
   "baidu"
   "alibaba"
+  "wechat"
   "tencent"
   "taobao"
   "alipay"
