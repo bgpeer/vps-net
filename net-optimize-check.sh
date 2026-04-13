@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🔍 Net-Optimize 状态检测脚本 v1.7（配合 v3.7.1）
+# 🔍 Net-Optimize 状态检测脚本 v1.8（配合 v3.7.1）
 # 新增：CPU 调频 / XPS / 中断合并 / MPTCP / WireGuard 检测
 # ==============================================================================
 set -euo pipefail
@@ -343,16 +343,16 @@ for _dcmd in iptables iptables-legacy iptables-nft; do
   has "$_dcmd" || continue
   _dscp_rules="$("$_dcmd" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP' || true)"
   [ -z "$_dscp_rules" ] && continue
-  _ef_v4="$(echo "$_dscp_rules" | grep -c '0x2e' || true)"; _ef_v4="${_ef_v4%%$'\n'*}"
-  _af41_v4="$(echo "$_dscp_rules" | grep -c '0x22' || true)"; _af41_v4="${_af41_v4%%$'\n'*}"
+  _ef_v4="$(echo "$_dscp_rules" | grep -cE '0x2e|dscp-class EF|set-dscp 46' || true)"; _ef_v4="${_ef_v4%%$'\n'*}"
+  _af41_v4="$(echo "$_dscp_rules" | grep -cE '0x22|dscp-class AF41|set-dscp 34' || true)"; _af41_v4="${_af41_v4%%$'\n'*}"
   break
 done
 for _dcmd6 in ip6tables ip6tables-legacy ip6tables-nft; do
   has "$_dcmd6" || continue
   _dscp6_rules="$("$_dcmd6" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP' || true)"
   [ -z "$_dscp6_rules" ] && continue
-  _ef_v6="$(echo "$_dscp6_rules" | grep -c '0x2e' || true)"; _ef_v6="${_ef_v6%%$'\n'*}"
-  _af41_v6="$(echo "$_dscp6_rules" | grep -c '0x22' || true)"; _af41_v6="${_af41_v6%%$'\n'*}"
+  _ef_v6="$(echo "$_dscp6_rules" | grep -cE '0x2e|dscp-class EF|set-dscp 46' || true)"; _ef_v6="${_ef_v6%%$'\n'*}"
+  _af41_v6="$(echo "$_dscp6_rules" | grep -cE '0x22|dscp-class AF41|set-dscp 34' || true)"; _af41_v6="${_af41_v6%%$'\n'*}"
   break
 done
 
