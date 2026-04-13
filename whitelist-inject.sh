@@ -1,5 +1,5 @@
 #!/bin/bash
-# whitelist-inject.sh v1.1
+# whitelist-inject.sh v1.2
 # 在 v2ray-agent sing-box 屏蔽中国域名规则前注入白名单放行规则
 # 用法: bash whitelist-inject.sh
 # 注意: 每次 vasma 修改配置后需重新执行
@@ -10,14 +10,13 @@ BACKUP="${CONFIG}.bak.$(date +%s)"
 
 # ===== 白名单规则集（按需增减，对应 .srs 文件名）=====
 WHITELIST_TAGS=(
+  "wechat"
   "douyin"
-  "wildrift"
   "bilibili"
   "zhihu"
   "xiaohongshu"
   "baidu"
   "alibaba"
-  "wechat"
   "tencent"
   "taobao"
   "alipay"
@@ -64,7 +63,7 @@ CLEAN=$(jq '
 
 echo "$CLEAN" > "$CONFIG"
 
-# 构建 rule_set 条目 JSON（与现有 cn_cn_block_route 格式一致，不加 format 字段）
+# 构建 rule_set 条目 JSON（与现有 cn_cn_block_route 格式一致）
 RULE_SET_JSON="[]"
 for tag in "${WHITELIST_TAGS[@]}"; do
   RULE_SET_JSON=$(echo "$RULE_SET_JSON" | jq \
@@ -120,15 +119,19 @@ echo "[信息] 配置校验通过"
 # 重启
 echo "[信息] 重启 sing-box..."
 systemctl restart sing-box
-sleep 5
 
-# 验证是否运行
-if systemctl is-active --quiet sing-box; then
-  echo "[完成] sing-box 运行中 ✓"
-else
-  echo "[错误] sing-box 未运行，回滚！"
-  cp "$BACKUP" "$CONFIG"
-  systemctl restart sing-box
-  echo "[信息] 已回滚并重启"
-  exit 1
-fi
+# 等待 sing-box 启动完成（最长等 60 秒）
+echo "[信息] 等待 sing-box 启动..."
+for i in $(seq 1 30); do
+  sleep 2
+  if systemctl is-active --quiet sing-box; then
+    echo "[完成] sing-box 运行中 ✓（等待了 $((i*2)) 秒）"
+    exit 0
+  fi
+done
+
+echo "[错误] sing-box 60秒内未启动，回滚！"
+cp "$BACKUP" "$CONFIG"
+systemctl restart sing-box
+echo "[信息] 已回滚并重启"
+exit 1
