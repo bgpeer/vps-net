@@ -1,5 +1,5 @@
 #!/bin/bash
-# whitelist-inject.sh v1.3
+# whitelist-inject.sh v1.5
 # 在 v2ray-agent sing-box 屏蔽中国域名/IP 规则前注入白名单放行规则
 # 用法: bash whitelist-inject.sh
 # 注意: 每次 vasma 修改配置后需重新执行
@@ -17,10 +17,7 @@ WHITELIST_TAGS=(
   "xiaohongshu"
   "baidu"
   "alibaba"
-  "wechat"
   "tencent"
-  "taobao"
-  "alipay"
   "jd"
   "netease"
   "sina"
@@ -48,6 +45,30 @@ if ! command -v jq &>/dev/null; then
   apt-get update -qq && apt-get install -y -qq jq
 fi
 
+# 预检：过滤掉仓库中不存在的规则集（HTTP 非 200 则跳过）
+echo "[信息] 预检规则集可用性..."
+VALID_TAGS=()
+SKIP_TAGS=()
+for tag in "${WHITELIST_TAGS[@]}"; do
+  status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+    "${URL_PREFIX}/${tag}.srs")
+  if [[ "$status" == "200" ]]; then
+    VALID_TAGS+=("$tag")
+  else
+    SKIP_TAGS+=("$tag")
+    echo "[跳过] ${tag}.srs (HTTP ${status})"
+  fi
+done
+
+if [[ ${#VALID_TAGS[@]} -eq 0 ]]; then
+  echo "[错误] 所有规则集均不可用，退出"
+  exit 1
+fi
+
+echo "[信息] 有效标签 (${#VALID_TAGS[@]}/${#WHITELIST_TAGS[@]}): ${VALID_TAGS[*]}"
+[[ ${#SKIP_TAGS[@]} -gt 0 ]] && echo "[信息] 已跳过 (${#SKIP_TAGS[@]}): ${SKIP_TAGS[*]}"
+echo ""
+
 # 备份
 cp "$CONFIG" "$BACKUP"
 echo "[信息] 已备份到 $BACKUP"
@@ -67,9 +88,9 @@ CLEAN=$(jq '
 
 echo "$CLEAN" > "$CONFIG"
 
-# 构建 rule_set 条目 JSON
+# 构建 rule_set 条目 JSON（仅使用预检通过的标签）
 RULE_SET_JSON="[]"
-for tag in "${WHITELIST_TAGS[@]}"; do
+for tag in "${VALID_TAGS[@]}"; do
   RULE_SET_JSON=$(echo "$RULE_SET_JSON" | jq \
     --arg tag "whitelist-${tag}" \
     --arg url "${URL_PREFIX}/${tag}.srs" \
@@ -83,7 +104,7 @@ done
 
 # 构建 rule_set 引用数组
 REFS_JSON="[]"
-for tag in "${WHITELIST_TAGS[@]}"; do
+for tag in "${VALID_TAGS[@]}"; do
   REFS_JSON=$(echo "$REFS_JSON" | jq --arg t "whitelist-${tag}" '. + [$t]')
 done
 
@@ -112,7 +133,7 @@ jq --argjson rsets "$RULE_SET_JSON" \
 
 echo ""
 echo "[完成] 白名单注入成功！"
-echo "放行标签: ${WHITELIST_TAGS[*]}"
+echo "放行标签: ${VALID_TAGS[*]}"
 echo ""
 echo "当前路由规则顺序:"
 jq -r '.route.rules[] |
