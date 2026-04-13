@@ -49,12 +49,20 @@ def extract_rules_from_payload(payload):
         stripped = line.lstrip()
 
         # ---------- 域名规则 ----------
-        # 收集 DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-WILDCARD 等
-        # 排除 DOMAIN-REGEX（regex 不适合丢给 behavior=domain）
+        # behavior=domain payload 只支持精确匹配和后缀匹配：
+        #   DOMAIN         → 精确匹配，不加点
+        #   DOMAIN-SUFFIX  → 后缀匹配，补充前导点
+        #   DOMAIN-KEYWORD / DOMAIN-WILDCARD / DOMAIN-REGEX → 不支持，跳过
         if stripped.startswith("DOMAIN") and not stripped.startswith("DOMAIN-REGEX"):
             parts = [p.strip() for p in line.split(",") if p.strip()]
             if len(parts) >= 2:
-                domains.add(parts[1])
+                rule_type = parts[0].upper()
+                val = parts[1]
+                if rule_type == "DOMAIN":
+                    domains.add(val)
+                elif rule_type == "DOMAIN-SUFFIX":
+                    domains.add(val if val.startswith(".") else "." + val)
+                # DOMAIN-KEYWORD / DOMAIN-WILDCARD: behavior=domain 不支持，跳过
             continue
 
         # ---------- IP 规则 ----------

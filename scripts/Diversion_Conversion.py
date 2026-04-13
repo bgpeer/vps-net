@@ -731,7 +731,11 @@ def main() -> None:
                         domains.append(d.strip().lstrip("."))
                 for ds in r.get("domain_suffix") or []:
                     if isinstance(ds, str) and ds.strip():
-                        domains.append(ds.strip().lstrip("."))
+                        vv = ds.strip()
+                        # MRS behavior=domain: 后缀匹配需要保留/补充前导点
+                        if not vv.startswith("."):
+                            vv = "." + vv
+                        domains.append(vv)
                 for c in r.get("ip_cidr") or []:
                     if isinstance(c, str) and c.strip():
                         cidrs.append(c.strip())
@@ -822,12 +826,18 @@ def main() -> None:
         # 先给 sing-box 出 SRS
         compile_singbox_srs_strict(build_singbox_source_json(b), name)
 
-        # 再给 mihomo 出 MRS（domain / ipcidr）
+        # 给 mihomo 出 MRS（domain / ipcidr）
+        # behavior=domain payload：
+        #   - domain       → 精确匹配，不加点
+        #   - domain_suffix → 后缀匹配，保留/补充前导点
+        #   - domain_keyword / domain_wildcard → behavior=domain 不支持，跳过
         domains_for_mrs = []
         for d in b["domain"]:
             domains_for_mrs.append(d.lstrip("."))
         for ds in b["domain_suffix"]:
-            domains_for_mrs.append(ds.lstrip("."))
+            # 保留/补充前导点，mihomo 用 .example.com 表示后缀匹配
+            vv = ds if ds.startswith(".") else "." + ds
+            domains_for_mrs.append(vv)
 
         domains_for_mrs = sorted(set(domains_for_mrs))
         ip_for_mrs = sorted(set(list(b["ip_cidr"]) + list(b["ip_cidr6"])))
