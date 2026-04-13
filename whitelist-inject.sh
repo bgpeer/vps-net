@@ -15,6 +15,7 @@ WHITELIST_TAGS=(
   "xiaohongshu"
   "baidu"
   "alibabacloud"
+  "alibaba"
   "tencent"
 )
 
