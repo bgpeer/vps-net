@@ -120,7 +120,7 @@ echo "[信息] 配置校验通过"
 # 重启
 echo "[信息] 重启 sing-box..."
 systemctl restart sing-box
-sleep 2
+sleep 5
 
 # 验证是否运行
 if systemctl is-active --quiet sing-box; then
