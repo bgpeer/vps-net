@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.7.0
+# 🚀 Net-Optimize-Ultimate v3.7.1
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
 # v3.7.0 新增：
 #   1) BBRv2/BBRv3 自动检测（内核支持时优先启用）
@@ -105,7 +105,7 @@ install -Dm755 "$0" "$SCRIPT_PATH" 2>/dev/null || true
 
 trap 'code=$?; echo "❌ 出错：第 ${BASH_LINENO[0]} 行 -> ${BASH_COMMAND} (退出码 $code)"; exit $code' ERR
 
-echo "🚀 Net-Optimize-Ultimate v3.7.0 开始执行..."
+echo "🚀 Net-Optimize-Ultimate v3.7.1 开始执行..."
 echo "========================================================"
 
 # === 2. 全局配置开关 ===
@@ -130,6 +130,7 @@ echo "========================================================"
 : "${ADAPTIVE_QOS:=1}"         # 自适应 QoS：流量高→抢带宽，流量低→游戏低延迟（自动切换）
 : "${ADAPTIVE_QOS_THRESHOLD:=1048576}"  # 自适应阈值（字节/秒，默认 1MB/s）
 : "${ADAPTIVE_QOS_INTERVAL:=2}"         # 采样间隔（秒）
+: "${ADAPTIVE_QOS_COOLDOWN:=10}"        # 抢带宽冷却时间（秒，流量降下后多久切回游戏模式）
 : "${ENABLE_CPU_GOVERNOR:=1}"           # CPU 调频切换到 performance 模式
 : "${ENABLE_XPS:=1}"                    # XPS 发送端包分发（配合 RPS）
 : "${ENABLE_IRQ_COALESCING:=1}"         # 网卡中断合并自适应调优
@@ -1517,6 +1518,7 @@ setup_adaptive_qos() {
   "iface": "$iface",
   "threshold": $ADAPTIVE_QOS_THRESHOLD,
   "interval": $ADAPTIVE_QOS_INTERVAL,
+  "cooldown": ${ADAPTIVE_QOS_COOLDOWN:-10},
   "has_cake": $([ "$has_cake" = "1" ] && echo "true" || echo "false"),
   "has_length": $([ "$has_length" = "1" ] && echo "true" || echo "false"),
   "ipt_backend": "$ipt_backend",
@@ -1571,6 +1573,13 @@ def read_tx_bytes(iface: str) -> int:
     except Exception:
         return 0
 
+def read_rx_bytes(iface: str) -> int:
+    try:
+        with open(f"/sys/class/net/{iface}/statistics/rx_bytes") as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
 # ---------------------------------------------------------------------------
 # Load config
 # ---------------------------------------------------------------------------
@@ -1583,14 +1592,15 @@ def load_conf() -> dict:
 # ---------------------------------------------------------------------------
 class AdaptiveQoS:
     def __init__(self, conf: dict):
-        self.iface      = conf["iface"]
-        self.threshold  = conf["threshold"]
-        self.interval   = conf["interval"]
-        self.has_cake   = conf.get("has_cake", False)
-        self.has_length = conf.get("has_length", False)
-        self.ipt        = conf.get("ipt_backend", "")
-        self.ip6        = conf.get("ip6_cmd", "")
-        self.mode       = "unknown"  # game / aggressive / unknown
+        self.iface         = conf["iface"]
+        self.threshold     = conf["threshold"]
+        self.interval      = conf["interval"]
+        self.cooldown_secs = conf.get("cooldown", 10)
+        self.has_cake      = conf.get("has_cake", False)
+        self.has_length    = conf.get("has_length", False)
+        self.ipt           = conf.get("ipt_backend", "")
+        self.ip6           = conf.get("ip6_cmd", "")
+        self.mode          = "unknown"  # game / aggressive / unknown
 
     # ---- tc: 游戏低延迟 ----
     def _apply_cake(self) -> bool:
@@ -1671,24 +1681,42 @@ class AdaptiveQoS:
 
     # ---- 主循环 ----
     def run_forever(self):
-        log.info("启动: iface=%s threshold=%d interval=%d",
-                 self.iface, self.threshold, self.interval)
+        cooldown_max = max(1, self.cooldown_secs // self.interval)
+        log.info("启动: iface=%s threshold=%d interval=%d cooldown=%ds(%d ticks)",
+                 self.iface, self.threshold, self.interval,
+                 self.cooldown_secs, cooldown_max)
 
         # 启动时先进入游戏模式
         self.switch_to_game()
 
+        prev_rx = read_rx_bytes(self.iface)
         prev_tx = read_tx_bytes(self.iface)
         time.sleep(self.interval)
 
+        cooldown_ticks = 0  # 抢带宽冷却计数器（>0 时保持抢带宽）
+
         while True:
+            rx = read_rx_bytes(self.iface)
             tx = read_tx_bytes(self.iface)
-            rate = (tx - prev_tx) // self.interval
+
+            # 入站/出站取最大值，任意方向达到阈值即触发抢带宽
+            rx_rate = (rx - prev_rx) // self.interval
+            tx_rate = (tx - prev_tx) // self.interval
+            rate = max(rx_rate, tx_rate)
+
+            prev_rx = rx
             prev_tx = tx
 
             if rate >= self.threshold:
+                # 流量达到阈值：立即抢带宽，重置冷却计时
+                cooldown_ticks = cooldown_max
                 self.switch_to_aggressive()
             else:
-                self.switch_to_game()
+                if cooldown_ticks > 0:
+                    # 冷却中：保持抢带宽，等流量稳定后再切回
+                    cooldown_ticks -= 1
+                else:
+                    self.switch_to_game()
 
             time.sleep(self.interval)
 
@@ -2739,7 +2767,7 @@ main() {
   require_root
   _ensure_swap
 
-  echo "🚀 Net-Optimize-Ultimate v3.7.0 启动..."
+  echo "🚀 Net-Optimize-Ultimate v3.7.1 启动..."
   echo "========================================================"
 
   clean_old_config
