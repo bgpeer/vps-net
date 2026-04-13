@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🔍 Net-Optimize 状态检测脚本 v1.8（配合 v3.7.1）
+# 🔍 Net-Optimize 状态检测脚本 v1.9（配合 v3.7.2）
 # 新增：CPU 调频 / XPS / 中断合并 / MPTCP / WireGuard 检测
 # ==============================================================================
 set -euo pipefail
@@ -71,7 +71,7 @@ detect_iface() {
 IPT_CMD="$(detect_ipt_backend)"
 OUT_IFACE="$(detect_iface)"
 
-echo "🔍 开始系统状态检测（Net-Optimize v3.7.1）..."
+echo "🔍 开始系统状态检测（Net-Optimize v3.7.2）..."
 title
 
 # === [1] 网络优化关键状态 ===
@@ -331,7 +331,7 @@ else
   if [[ "$_aggressive" -eq 1 ]]; then
     echo "  ℹ️ 游戏 QoS 未启用（激进模式下互斥）"
   else
-    echo "  ℹ️ 游戏 QoS 未启用（ENABLE_GAME_QOS=0 或未运行 v3.7.1+）"
+    echo "  ℹ️ 游戏 QoS 未启用（ENABLE_GAME_QOS=0 或未运行 v3.7.2+）"
   fi
 fi
 
@@ -520,7 +520,7 @@ fi
 printf "  %-10s: %s\n" "运行" "$(uptime -p 2>/dev/null || echo '?')"
 if [[ -f /usr/local/sbin/net-optimize-ultimate.sh ]]; then
   _ver="$(grep -oP 'v\d+\.\d+\.\d+' /usr/local/sbin/net-optimize-ultimate.sh | head -n1)"
-  [[ "$_ver" == "v3.7.1" ]] && green "✅ 脚本版本：$_ver" || yellow "⚠️ 脚本版本：$_ver（建议升级到 v3.7.1）"
+  [[ "$_ver" == "v3.7.2" ]] && green "✅ 脚本版本：$_ver" || yellow "⚠️ 脚本版本：$_ver（建议升级到 v3.7.2）"
 fi
 [[ -n "$IPT_CMD" ]] && echo "  ℹ️ iptables 后端：$IPT_CMD"
 [[ -n "$OUT_IFACE" ]] && echo "  ℹ️ 出口网卡：$OUT_IFACE"
