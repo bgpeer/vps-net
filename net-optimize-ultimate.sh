@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.7.1
+# 🚀 Net-Optimize-Ultimate v3.7.2
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
 # v3.7.0 新增：
 #   1) BBRv2/BBRv3 自动检测（内核支持时优先启用）
@@ -1064,7 +1064,7 @@ setup_dscp_marking() {
   for cmd in iptables iptables-legacy iptables-nft; do
     have_cmd "$cmd" || continue
     local _dscp_rules
-    _dscp_rules="$("$cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x2e' || true)"
+    _dscp_rules="$("$cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E '0x2e|dscp-class EF|set-dscp 46' || true)"
     [ -z "$_dscp_rules" ] && continue
     while IFS= read -r rule; do
       [ -z "$rule" ] && continue
@@ -1098,7 +1098,7 @@ setup_dscp_marking() {
   if [ -n "$ip6_cmd" ]; then
     # 清理旧 IPv6 DSCP
     local _dscp6_rules
-    _dscp6_rules="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x2e' || true)"
+    _dscp6_rules="$("$ip6_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E '0x2e|dscp-class EF|set-dscp 46' || true)"
     if [ -n "$_dscp6_rules" ]; then
       while IFS= read -r rule; do
         [ -z "$rule" ] && continue
@@ -1408,7 +1408,7 @@ setup_game_qos() {
     local _af41_rules
     for _cmd in "$ipt_backend" ${ip6_cmd:+"$ip6_cmd"}; do
       [ -n "$_cmd" ] && have_cmd "$_cmd" || continue
-      _af41_rules="$("$_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
+      _af41_rules="$("$_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E '0x22|dscp-class AF41|set-dscp 34' || true)"
       if [ -n "$_af41_rules" ]; then
         while IFS= read -r rule; do
           [ -z "$rule" ] && continue
@@ -1502,7 +1502,7 @@ setup_adaptive_qos() {
     return 0
   fi
 
-  # === 检测 -m length 模块可用性 ===
+  # === 检测 -m length 模块可用性（IPv4 和 IPv6 分别测试）===
   local has_length=0
   if [ -n "$ipt_backend" ] && have_cmd "$ipt_backend"; then
     if "$ipt_backend" -t mangle -A POSTROUTING -p udp -m length --length 0:200 -j RETURN 2>/dev/null; then
@@ -1510,7 +1510,16 @@ setup_adaptive_qos() {
       has_length=1
     fi
   fi
-  [ "$has_length" = "0" ] && echo "  ⚠️ iptables -m length 不可用，AF41 标记将跳过"
+  [ "$has_length" = "0" ] && echo "  ⚠️ iptables -m length 不可用，IPv4 AF41 标记将跳过"
+
+  local has_length_ip6=0
+  if [ -n "$ip6_cmd" ] && have_cmd "$ip6_cmd"; then
+    if "$ip6_cmd" -t mangle -A POSTROUTING -p udp -m length --length 0:200 -j RETURN 2>/dev/null; then
+      "$ip6_cmd" -t mangle -D POSTROUTING -p udp -m length --length 0:200 -j RETURN 2>/dev/null || true
+      has_length_ip6=1
+    fi
+  fi
+  [ "$has_length_ip6" = "0" ] && [ -n "$ip6_cmd" ] && echo "  ⚠️ ip6tables -m length 不可用，IPv6 AF41 标记将跳过"
 
   # === 写入 JSON 配置 ===
   cat >"$CONFIG_DIR/adaptive-qos.conf" <<CONFEOF
@@ -1521,6 +1530,7 @@ setup_adaptive_qos() {
   "cooldown": ${ADAPTIVE_QOS_COOLDOWN:-10},
   "has_cake": $([ "$has_cake" = "1" ] && echo "true" || echo "false"),
   "has_length": $([ "$has_length" = "1" ] && echo "true" || echo "false"),
+  "has_length_ip6": $([ "$has_length_ip6" = "1" ] && echo "true" || echo "false"),
   "ipt_backend": "$ipt_backend",
   "ip6_cmd": "$ip6_cmd"
 }
@@ -1597,9 +1607,10 @@ class AdaptiveQoS:
         self.interval      = conf["interval"]
         self.cooldown_secs = conf.get("cooldown", 10)
         self.has_cake      = conf.get("has_cake", False)
-        self.has_length    = conf.get("has_length", False)
-        self.ipt           = conf.get("ipt_backend", "")
-        self.ip6           = conf.get("ip6_cmd", "")
+        self.has_length     = conf.get("has_length", False)
+        self.has_length_ip6 = conf.get("has_length_ip6", conf.get("has_length", False))
+        self.ipt            = conf.get("ipt_backend", "")
+        self.ip6            = conf.get("ip6_cmd", "")
         self.mode          = "unknown"  # game / aggressive / unknown
 
     # ---- tc: 游戏低延迟 ----
@@ -1633,7 +1644,7 @@ class AdaptiveQoS:
 
     # ---- DSCP AF41: 游戏小包标记 ----
     def _clear_af41(self):
-        """清除所有 AF41 (0x22) DSCP 规则"""
+        """清除所有 AF41 DSCP 规则（兼容 0x22 / dscp-class AF41 / set-dscp 34）"""
         for cmd in [self.ipt, self.ip6]:
             if not cmd or not has_cmd(cmd):
                 continue
@@ -1641,22 +1652,27 @@ class AdaptiveQoS:
             if r.returncode != 0:
                 continue
             for line in r.stdout.splitlines():
-                if "0x22" not in line:
+                if "0x22" not in line and "dscp-class AF41" not in line and "set-dscp 34" not in line:
                     continue
                 del_rule = line.replace("-A POSTROUTING", "-D POSTROUTING", 1)
                 run(f"{cmd} -t mangle {del_rule}")
 
     def _apply_af41(self):
         """写入 AF41 DSCP: UDP ≤200B 非443 端口"""
-        if not self.has_length:
-            return
         self._clear_af41()
-        opts = ("-p udp ! --dport 443 -m length --length 0:200 "
-                "-j DSCP --set-dscp-class AF41")
-        if self.ipt and has_cmd(self.ipt):
-            run(f"{self.ipt} -t mangle -A POSTROUTING -o {self.iface} {opts}")
+        opts_len = ("-p udp ! --dport 443 -m length --length 0:200 "
+                    "-j DSCP --set-dscp-class AF41")
+        opts_nolen = "-p udp ! --dport 443 -j DSCP --set-dscp-class AF41"
+        if self.ipt and has_cmd(self.ipt) and self.has_length:
+            run(f"{self.ipt} -t mangle -A POSTROUTING -o {self.iface} {opts_len}")
         if self.ip6 and has_cmd(self.ip6):
-            run(f"{self.ip6} -t mangle -A POSTROUTING -o {self.iface} {opts}")
+            if self.has_length_ip6:
+                r = run(f"{self.ip6} -t mangle -A POSTROUTING -o {self.iface} {opts_len}")
+                if r.returncode != 0:
+                    # ip6tables -m length 不支持时降级为不带长度过滤的规则
+                    run(f"{self.ip6} -t mangle -A POSTROUTING -o {self.iface} {opts_nolen}")
+            else:
+                run(f"{self.ip6} -t mangle -A POSTROUTING -o {self.iface} {opts_nolen}")
 
     # ---- 模式切换 ----
     def switch_to_game(self):
@@ -2446,7 +2462,7 @@ if [ -f "$CONFIG_FILE" ]; then
       # 清理旧 AF41（所有 IPv4 后端都清）
       for _af41_clean in iptables iptables-nft iptables-legacy; do
         command -v "$_af41_clean" >/dev/null 2>&1 || continue
-        _af41_old="$("$_af41_clean" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
+        _af41_old="$("$_af41_clean" -t mangle -S POSTROUTING 2>/dev/null | grep -E '0x22|dscp-class AF41|set-dscp 34' || true)"
         if [ -n "$_af41_old" ]; then
           while IFS= read -r rule; do
             [ -z "$rule" ] && continue
@@ -2467,11 +2483,11 @@ if [ -f "$CONFIG_FILE" ]; then
         command -v "$_af41_dedup" >/dev/null 2>&1 || continue
         _af41_dd=0
         while :; do
-          _af41_cnt="$("$_af41_dedup" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x22' || true)"
+          _af41_cnt="$("$_af41_dedup" -t mangle -S POSTROUTING 2>/dev/null | grep -cE '0x22|dscp-class AF41|set-dscp 34' || true)"
           _af41_cnt="${_af41_cnt%%$'\n'*}"; _af41_cnt="${_af41_cnt:-0}"
           [ "$_af41_cnt" -le 1 ] && break
           _af41_dd=$((_af41_dd + 1)); [ "$_af41_dd" -gt 20 ] && break
-          _af41_f="$("$_af41_dedup" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP.*0x22' | head -n1 || true)"
+          _af41_f="$("$_af41_dedup" -t mangle -S POSTROUTING 2>/dev/null | grep -E '0x22|dscp-class AF41|set-dscp 34' | head -n1 || true)"
           [ -z "$_af41_f" ] && break
           _af41_d="${_af41_f/-A POSTROUTING/-D POSTROUTING}"
           read -r -a _af41_p <<<"$_af41_d"
@@ -2482,7 +2498,7 @@ if [ -f "$CONFIG_FILE" ]; then
 
     # --- IPv6 AF41 ---
     if [ -n "$IP6_CMD" ]; then
-      _af41_6_old="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'DSCP.*0x22' || true)"
+      _af41_6_old="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -E '0x22|dscp-class AF41|set-dscp 34' || true)"
       if [ -n "$_af41_6_old" ]; then
         while IFS= read -r rule; do
           [ -z "$rule" ] && continue
@@ -2499,11 +2515,11 @@ if [ -f "$CONFIG_FILE" ]; then
       # 去重
       _af41_6_dd=0
       while :; do
-        _af41_6_cnt="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x22' || true)"
+        _af41_6_cnt="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -cE '0x22|dscp-class AF41|set-dscp 34' || true)"
         _af41_6_cnt="${_af41_6_cnt%%$'\n'*}"; _af41_6_cnt="${_af41_6_cnt:-0}"
         [ "$_af41_6_cnt" -le 1 ] && break
         _af41_6_dd=$((_af41_6_dd + 1)); [ "$_af41_6_dd" -gt 20 ] && break
-        _af41_6_f="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep 'DSCP.*0x22' | head -n1 || true)"
+        _af41_6_f="$("$IP6_CMD" -t mangle -S POSTROUTING 2>/dev/null | grep -E '0x22|dscp-class AF41|set-dscp 34' | head -n1 || true)"
         [ -z "$_af41_6_f" ] && break
         _af41_6_d="${_af41_6_f/-A POSTROUTING/-D POSTROUTING}"
         read -r -a _af41_6_p <<<"$_af41_6_d"
@@ -2526,7 +2542,7 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 
   # 对每个后端，TCPMSS/DSCP 各只保留 1 条
-  for _dd_pattern in TCPMSS 'DSCP.*0x2e' 'DSCP.*0x22'; do
+  for _dd_pattern in TCPMSS '0x2e|dscp-class EF|set-dscp 46' '0x22|dscp-class AF41|set-dscp 34'; do
     for _dd_cmd in iptables iptables-legacy iptables-nft; do
       command -v "$_dd_cmd" >/dev/null 2>&1 || continue
       _dd_r=0
@@ -2562,8 +2578,8 @@ fi
 
 # 日志：最终规则数
 _final_tcpmss="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'TCPMSS' || true)"
-_final_ef="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x2e' || true)"
-_final_af41="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'DSCP.*0x22' || true)"
+_final_ef="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -cE '0x2e|dscp-class EF|set-dscp 46' || true)"
+_final_af41="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -cE '0x22|dscp-class AF41|set-dscp 34' || true)"
 logger -t net-optimize "BOOT: 最终 TCPMSS=$_final_tcpmss EF=$_final_ef AF41=$_final_af41"
 
 echo "[$(date)] Net-Optimize v3.7.0 开机优化完成"
