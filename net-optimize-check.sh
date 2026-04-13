@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🔍 Net-Optimize 状态检测脚本 v1.9（配合 v3.7.2）
+# 🔍 Net-Optimize 状态检测脚本 v1.10（配合 v3.7.2）
 # 新增：CPU 调频 / XPS / 中断合并 / MPTCP / WireGuard 检测
 # ==============================================================================
 set -euo pipefail
@@ -377,8 +377,9 @@ else
 fi
 
 if [[ -f /proc/net/nf_conntrack ]]; then
-  tcp_c="$(safe_grep_count '^tcp' /proc/net/nf_conntrack)"
-  udp_c="$(safe_grep_count '^udp' /proc/net/nf_conntrack)"
+  # /proc/net/nf_conntrack 行格式：ipv4/ipv6  2  tcp/udp  ...（协议在第 3 列）
+  tcp_c="$(awk '$3=="tcp"' /proc/net/nf_conntrack 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
+  udp_c="$(awk '$3=="udp"' /proc/net/nf_conntrack 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
   total_c="$(wc -l < /proc/net/nf_conntrack 2>/dev/null | tr -d ' ' || echo 0)"
   other_c=$(( total_c - tcp_c - udp_c )); [[ "$other_c" -lt 0 ]] && other_c=0
   echo "  🔸 TCP=$tcp_c UDP=$udp_c Other=$other_c Total=$total_c"
