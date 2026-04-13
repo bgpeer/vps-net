@@ -1,5 +1,5 @@
 #!/bin/bash
-# whitelist-inject.sh v1.3
+# whitelist-inject.sh v1.4
 # 在 v2ray-agent sing-box 屏蔽中国域名/IP 规则前注入白名单放行规则
 # 用法: bash whitelist-inject.sh
 # 注意: 每次 vasma 修改配置后需重新执行
@@ -17,10 +17,7 @@ WHITELIST_TAGS=(
   "xiaohongshu"
   "baidu"
   "alibaba"
-  "wechat"
   "tencent"
-  "taobao"
-  "alipay"
   "jd"
   "netease"
   "sina"
