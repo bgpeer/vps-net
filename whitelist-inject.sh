@@ -1,25 +1,32 @@
 #!/bin/bash
-# whitelist-inject.sh v1.0
+# whitelist-inject.sh v1.1
 # 在 v2ray-agent sing-box 屏蔽中国域名规则前注入白名单放行规则
 # 用法: bash whitelist-inject.sh
+# 注意: 每次 vasma 修改配置后需重新执行
 
 CONFIG="/etc/v2ray-agent/sing-box/conf/config.json"
+SINGBOX_BIN="/etc/v2ray-agent/sing-box/sing-box"
 BACKUP="${CONFIG}.bak.$(date +%s)"
 
 # ===== 白名单规则集（按需增减，对应 .srs 文件名）=====
 WHITELIST_TAGS=(
-  "wechat"
   "douyin"
+  "wildrift"
   "bilibili"
   "zhihu"
   "xiaohongshu"
   "baidu"
-  "alibabacloud"
   "alibaba"
+  "wechat"
   "tencent"
+  "taobao"
+  "alipay"
+  "jd"
+  "netease"
+  "sina"
 )
 
-# 规则集 URL 前缀（可换成 gh.669588.xyz 代理）
+# 规则集 URL 前缀
 URL_PREFIX="https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite"
 
 # ================================================================
@@ -28,6 +35,11 @@ set -e
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "[错误] 配置文件不存在: $CONFIG"
+  exit 1
+fi
+
+if [[ ! -x "$SINGBOX_BIN" ]]; then
+  echo "[错误] sing-box 二进制不存在: $SINGBOX_BIN"
   exit 1
 fi
 
@@ -52,7 +64,7 @@ CLEAN=$(jq '
 
 echo "$CLEAN" > "$CONFIG"
 
-# 构建 rule_set 条目 JSON
+# 构建 rule_set 条目 JSON（与现有 cn_cn_block_route 格式一致，不加 format 字段）
 RULE_SET_JSON="[]"
 for tag in "${WHITELIST_TAGS[@]}"; do
   RULE_SET_JSON=$(echo "$RULE_SET_JSON" | jq \
@@ -61,7 +73,6 @@ for tag in "${WHITELIST_TAGS[@]}"; do
     '. + [{
       "type": "remote",
       "tag": $tag,
-      "format": "binary",
       "url": $url,
       "download_detour": "01_direct_outbound"
     }]')
@@ -94,6 +105,30 @@ echo "当前路由规则顺序:"
 jq -r '.route.rules[] | if .rule_set then "  → rule_set: \(.rule_set) → \(.outbound)" elif .domain_regex then "  → domain_regex → \(.outbound)" elif .action then "  → action: \(.action)" else "  → \(.)" end' "$CONFIG"
 echo ""
 
+# 校验配置
+echo "[信息] 校验配置..."
+CHECK_RESULT=$("$SINGBOX_BIN" check -c "$CONFIG" 2>&1)
+if [[ $? -ne 0 ]]; then
+  echo "[错误] 配置校验失败，回滚！"
+  echo "$CHECK_RESULT"
+  cp "$BACKUP" "$CONFIG"
+  echo "[信息] 已回滚到备份"
+  exit 1
+fi
+echo "[信息] 配置校验通过"
+
 # 重启
 echo "[信息] 重启 sing-box..."
-systemctl restart sing-box && echo "[完成] sing-box 已重启" || echo "[错误] 重启失败，请检查配置"
+systemctl restart sing-box
+sleep 2
+
+# 验证是否运行
+if systemctl is-active --quiet sing-box; then
+  echo "[完成] sing-box 运行中 ✓"
+else
+  echo "[错误] sing-box 未运行，回滚！"
+  cp "$BACKUP" "$CONFIG"
+  systemctl restart sing-box
+  echo "[信息] 已回滚并重启"
+  exit 1
+fi
