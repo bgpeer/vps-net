@@ -1,5 +1,5 @@
 #!/bin/bash
-# whitelist-inject.sh v2.0
+# whitelist-inject.sh v2.1
 # 在 v2ray-agent sing-box 屏蔽中国域名/IP 规则前注入白名单放行规则，并屏蔽广告
 # 用法: bash whitelist-inject.sh
 # 注意: 每次 vasma 修改配置后需重新执行
@@ -55,6 +55,7 @@ if ! command -v jq &>/dev/null; then
 fi
 
 # 预检函数：过滤不存在的规则集（HTTP 非 200 则跳过）
+# 诊断信息全部输出到 stderr，stdout 只输出有效标签列表（供 $() 捕获）
 precheck_tags() {
   local label="$1"
   shift
@@ -62,7 +63,7 @@ precheck_tags() {
   local valid=()
   local skip=()
 
-  echo "[信息] 预检${label}规则集..."
+  echo "[信息] 预检${label}规则集..." >&2
   for tag in "${tags[@]}"; do
     status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
       "${URL_PREFIX}/${tag}.srs")
@@ -70,14 +71,14 @@ precheck_tags() {
       valid+=("$tag")
     else
       skip+=("$tag")
-      echo "[跳过] ${tag}.srs (HTTP ${status})"
+      echo "[跳过] ${tag}.srs (HTTP ${status})" >&2
     fi
   done
 
-  echo "[信息] ${label}有效 (${#valid[@]}/${#tags[@]}): ${valid[*]:-无}"
-  [[ ${#skip[@]} -gt 0 ]] && echo "[信息] ${label}跳过 (${#skip[@]}): ${skip[*]}"
+  echo "[信息] ${label}有效 (${#valid[@]}/${#tags[@]}): ${valid[*]:-无}" >&2
+  [[ ${#skip[@]} -gt 0 ]] && echo "[信息] ${label}跳过 (${#skip[@]}): ${skip[*]}" >&2
 
-  # 通过 stdout 返回有效列表（空格分隔）
+  # 仅将有效标签列表输出到 stdout
   echo "${valid[*]}"
 }
 
@@ -189,10 +190,13 @@ jq -r '.route.rules[] |
   end' "$CONFIG"
 echo ""
 
-# 校验配置
+# 校验配置（set -e 会导致命令替换失败时直接退出，需临时关闭）
 echo "[信息] 校验配置..."
+set +e
 CHECK_RESULT=$("$SINGBOX_BIN" check -c "$CONFIG" 2>&1)
-if [[ $? -ne 0 ]]; then
+CHECK_STATUS=$?
+set -e
+if [[ $CHECK_STATUS -ne 0 ]]; then
   echo "[错误] 配置校验失败，回滚！"
   echo "$CHECK_RESULT"
   cp "$BACKUP" "$CONFIG"
