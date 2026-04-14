@@ -1,6 +1,6 @@
 #!/bin/bash
-# whitelist-inject.sh v1.5
-# 在 v2ray-agent sing-box 屏蔽中国域名/IP 规则前注入白名单放行规则
+# whitelist-inject.sh v2.0
+# 在 v2ray-agent sing-box 屏蔽中国域名/IP 规则前注入白名单放行规则，并屏蔽广告
 # 用法: bash whitelist-inject.sh
 # 注意: 每次 vasma 修改配置后需重新执行
 
@@ -22,6 +22,14 @@ WHITELIST_TAGS=(
   "netease"
   "sina"
 )
+
+# ===== 广告屏蔽规则集（按需增减，对应 .srs 文件名）=====
+AD_BLOCK_TAGS=(
+  "category-ads-all"
+)
+
+# 广告拦截使用的出站（与 cn_block 相同，直接丢弃流量）
+AD_BLOCK_OUTBOUND="block_ip_outbound"
 
 # 规则集 URL 前缀
 URL_PREFIX="https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite"
@@ -45,79 +53,104 @@ if ! command -v jq &>/dev/null; then
   apt-get update -qq && apt-get install -y -qq jq
 fi
 
-# 预检：过滤掉仓库中不存在的规则集（HTTP 非 200 则跳过）
-echo "[信息] 预检规则集可用性..."
-VALID_TAGS=()
-SKIP_TAGS=()
-for tag in "${WHITELIST_TAGS[@]}"; do
-  status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
-    "${URL_PREFIX}/${tag}.srs")
-  if [[ "$status" == "200" ]]; then
-    VALID_TAGS+=("$tag")
-  else
-    SKIP_TAGS+=("$tag")
-    echo "[跳过] ${tag}.srs (HTTP ${status})"
-  fi
-done
+# 预检函数：过滤不存在的规则集（HTTP 非 200 则跳过）
+precheck_tags() {
+  local label="$1"
+  shift
+  local tags=("$@")
+  local valid=()
+  local skip=()
 
-if [[ ${#VALID_TAGS[@]} -eq 0 ]]; then
+  echo "[信息] 预检${label}规则集..."
+  for tag in "${tags[@]}"; do
+    status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+      "${URL_PREFIX}/${tag}.srs")
+    if [[ "$status" == "200" ]]; then
+      valid+=("$tag")
+    else
+      skip+=("$tag")
+      echo "[跳过] ${tag}.srs (HTTP ${status})"
+    fi
+  done
+
+  echo "[信息] ${label}有效 (${#valid[@]}/${#tags[@]}): ${valid[*]:-无}"
+  [[ ${#skip[@]} -gt 0 ]] && echo "[信息] ${label}跳过 (${#skip[@]}): ${skip[*]}"
+
+  # 通过 stdout 返回有效列表（空格分隔）
+  echo "${valid[*]}"
+}
+
+# 分别预检白名单和广告屏蔽规则集
+VALID_WL_STR=$(precheck_tags "白名单" "${WHITELIST_TAGS[@]}")
+VALID_WL=($VALID_WL_STR)
+echo ""
+
+VALID_AD_STR=$(precheck_tags "广告屏蔽" "${AD_BLOCK_TAGS[@]}")
+VALID_AD=($VALID_AD_STR)
+echo ""
+
+if [[ ${#VALID_WL[@]} -eq 0 && ${#VALID_AD[@]} -eq 0 ]]; then
   echo "[错误] 所有规则集均不可用，退出"
   exit 1
 fi
-
-echo "[信息] 有效标签 (${#VALID_TAGS[@]}/${#WHITELIST_TAGS[@]}): ${VALID_TAGS[*]}"
-[[ ${#SKIP_TAGS[@]} -gt 0 ]] && echo "[信息] 已跳过 (${#SKIP_TAGS[@]}): ${SKIP_TAGS[*]}"
-echo ""
 
 # 备份
 cp "$CONFIG" "$BACKUP"
 echo "[信息] 已备份到 $BACKUP"
 
-# 先清除之前注入的白名单规则（幂等，可重复执行）
+# 清除之前注入的规则（幂等，可重复执行）
 CLEAN=$(jq '
-  .route.rule_set = [.route.rule_set[] | select(.tag | startswith("whitelist-") | not)] |
+  .route.rule_set = [.route.rule_set[] | select(
+    .tag | (startswith("whitelist-") or startswith("adblock-")) | not
+  )] |
   .route.rules = [.route.rules[] | select(
     if .rule_set then
       (if (.rule_set | type) == "array"
-       then (.rule_set | any(startswith("whitelist-"))) | not
-       else (.rule_set | startswith("whitelist-")) | not
+       then (.rule_set | any(startswith("whitelist-") or startswith("adblock-"))) | not
+       else ((.rule_set | startswith("whitelist-")) or (.rule_set | startswith("adblock-"))) | not
        end)
     else true end
   )]
 ' "$CONFIG")
-
 echo "$CLEAN" > "$CONFIG"
 
-# 构建 rule_set 条目 JSON（仅使用预检通过的标签）
-RULE_SET_JSON="[]"
-for tag in "${VALID_TAGS[@]}"; do
-  RULE_SET_JSON=$(echo "$RULE_SET_JSON" | jq \
+# 构建白名单 rule_set 条目 JSON
+WL_RSETS_JSON="[]"
+for tag in "${VALID_WL[@]}"; do
+  WL_RSETS_JSON=$(echo "$WL_RSETS_JSON" | jq \
     --arg tag "whitelist-${tag}" \
     --arg url "${URL_PREFIX}/${tag}.srs" \
-    '. + [{
-      "type": "remote",
-      "tag": $tag,
-      "url": $url,
-      "download_detour": "01_direct_outbound"
-    }]')
+    '. + [{"type":"remote","tag":$tag,"url":$url,"download_detour":"01_direct_outbound"}]')
 done
 
-# 构建 rule_set 引用数组
-REFS_JSON="[]"
-for tag in "${VALID_TAGS[@]}"; do
-  REFS_JSON=$(echo "$REFS_JSON" | jq --arg t "whitelist-${tag}" '. + [$t]')
+WL_REFS_JSON="[]"
+for tag in "${VALID_WL[@]}"; do
+  WL_REFS_JSON=$(echo "$WL_REFS_JSON" | jq --arg t "whitelist-${tag}" '. + [$t]')
 done
 
-# 注入：
-# 找到 geoip 封锁 或 cn_block 规则中最靠前的位置，在其前面插入白名单
-# 这样白名单优先于 IP 封锁和域名封锁两道规则
-jq --argjson rsets "$RULE_SET_JSON" \
-   --argjson refs "$REFS_JSON" \
+# 构建广告屏蔽 rule_set 条目 JSON
+AD_RSETS_JSON="[]"
+for tag in "${VALID_AD[@]}"; do
+  AD_RSETS_JSON=$(echo "$AD_RSETS_JSON" | jq \
+    --arg tag "adblock-${tag}" \
+    --arg url "${URL_PREFIX}/${tag}.srs" \
+    '. + [{"type":"remote","tag":$tag,"url":$url,"download_detour":"01_direct_outbound"}]')
+done
+
+AD_REFS_JSON="[]"
+for tag in "${VALID_AD[@]}"; do
+  AD_REFS_JSON=$(echo "$AD_REFS_JSON" | jq --arg t "adblock-${tag}" '. + [$t]')
+done
+
+# 注入规则（顺序：白名单 → 广告屏蔽 → CN封锁）
+jq --argjson wl_rsets "$WL_RSETS_JSON" \
+   --argjson wl_refs  "$WL_REFS_JSON"  \
+   --argjson ad_rsets "$AD_RSETS_JSON" \
+   --argjson ad_refs  "$AD_REFS_JSON"  \
+   --arg     ad_out   "$AD_BLOCK_OUTBOUND" \
    '
-   # 追加 rule_set 定义
-   .route.rule_set += $rsets |
+   .route.rule_set += $wl_rsets + $ad_rsets |
 
-   # 找到第一个封锁规则（geoip 或 cn_block），在其前面插入白名单
    .route.rules as $rules |
    (
      $rules | to_entries | map(select(
@@ -128,12 +161,19 @@ jq --argjson rsets "$RULE_SET_JSON" \
        ))
      )) | .[0].key // 1
    ) as $idx |
-   .route.rules = ($rules[:$idx] + [{"rule_set": $refs, "outbound": "01_direct_outbound"}] + $rules[$idx:])
+
+   .route.rules = (
+     $rules[:$idx] +
+     (if ($wl_refs | length) > 0  then [{"rule_set": $wl_refs, "outbound": "01_direct_outbound"}] else [] end) +
+     (if ($ad_refs | length) > 0  then [{"rule_set": $ad_refs, "outbound": $ad_out}]              else [] end) +
+     $rules[$idx:]
+   )
    ' "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
 
 echo ""
-echo "[完成] 白名单注入成功！"
-echo "放行标签: ${VALID_TAGS[*]}"
+echo "[完成] 注入成功！"
+[[ ${#VALID_WL[@]} -gt 0 ]] && echo "白名单放行: ${VALID_WL[*]}"
+[[ ${#VALID_AD[@]} -gt 0 ]] && echo "广告屏蔽:   ${VALID_AD[*]}"
 echo ""
 echo "当前路由规则顺序:"
 jq -r '.route.rules[] |
