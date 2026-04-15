@@ -521,7 +521,7 @@ fi
 printf "  %-10s: %s\n" "运行" "$(uptime -p 2>/dev/null || echo '?')"
 if [[ -f /usr/local/sbin/net-optimize-ultimate.sh ]]; then
   _ver="$(grep -oP 'v\d+\.\d+\.\d+' /usr/local/sbin/net-optimize-ultimate.sh | head -n1)"
-  [[ "$_ver" == "v3.7.3" ]] && green "✅ 脚本版本：$_ver" || yellow "⚠️ 脚本版本：$_ver（建议升级到 v3.7.3）"
+  [[ -n "$_ver" ]] && green "✅ 脚本版本：$_ver"
 fi
 [[ -n "$IPT_CMD" ]] && echo "  ℹ️ iptables 后端：$IPT_CMD"
 [[ -n "$OUT_IFACE" ]] && echo "  ℹ️ 出口网卡：$OUT_IFACE"
