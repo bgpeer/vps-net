@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.7.3
+# 🚀 Net-Optimize-Ultimate v3.7.4
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
 # v3.7.0 新增：
 #   1) BBRv2/BBRv3 自动检测（内核支持时优先启用）
@@ -105,7 +105,7 @@ install -Dm755 "$0" "$SCRIPT_PATH" 2>/dev/null || true
 
 trap 'code=$?; echo "❌ 出错：第 ${BASH_LINENO[0]} 行 -> ${BASH_COMMAND} (退出码 $code)"; exit $code' ERR
 
-echo "🚀 Net-Optimize-Ultimate v3.7.3 开始执行..."
+echo "🚀 Net-Optimize-Ultimate v3.7.4 开始执行..."
 echo "========================================================"
 
 # === 2. 全局配置开关 ===
@@ -128,9 +128,12 @@ echo "========================================================"
 : "${AGGRESSIVE_MODE:=0}"      # 激进模式：抢带宽（类似 Hy2 暴力发包思路）
 : "${ENABLE_GAME_QOS:=1}"      # 游戏低延迟 QoS（cake/prio 双方案自动选择）
 : "${ADAPTIVE_QOS:=1}"         # 自适应 QoS：流量高→抢带宽，流量低→游戏低延迟（自动切换）
+: "${ADAPTIVE_QOS_MODE:=adaptive}"      # QoS 模式: adaptive=自适应切换 / fixed_cake=固定 cake 不切换
 : "${ADAPTIVE_QOS_THRESHOLD:=1048576}"  # 自适应阈值（字节/秒，默认 1MB/s）
 : "${ADAPTIVE_QOS_INTERVAL:=2}"         # 采样间隔（秒）
 : "${ADAPTIVE_QOS_COOLDOWN:=10}"        # 抢带宽冷却时间（秒，流量降下后多久切回游戏模式）
+# fixed_cake 模式：强制关闭自适应守护，走 setup_game_qos 固定 cake
+[ "${ADAPTIVE_QOS_MODE}" = "fixed_cake" ] && ADAPTIVE_QOS=0
 : "${ENABLE_CPU_GOVERNOR:=1}"           # CPU 调频切换到 performance 模式
 : "${ENABLE_XPS:=1}"                    # XPS 发送端包分发（配合 RPS）
 : "${ENABLE_IRQ_COALESCING:=1}"         # 网卡中断合并自适应调优
@@ -1458,9 +1461,16 @@ setup_game_qos() {
     grep -q '^GAME_QOS_SCHEME=' "$CONFIG_FILE" 2>/dev/null \
       && sed -i "s/^GAME_QOS_SCHEME=.*/GAME_QOS_SCHEME=$qos_scheme/" "$CONFIG_FILE" \
       || echo "GAME_QOS_SCHEME=$qos_scheme" >> "$CONFIG_FILE"
+    grep -q '^ADAPTIVE_QOS_MODE=' "$CONFIG_FILE" 2>/dev/null \
+      && sed -i "s/^ADAPTIVE_QOS_MODE=.*/ADAPTIVE_QOS_MODE=${ADAPTIVE_QOS_MODE:-adaptive}/" "$CONFIG_FILE" \
+      || echo "ADAPTIVE_QOS_MODE=${ADAPTIVE_QOS_MODE:-adaptive}" >> "$CONFIG_FILE"
   fi
 
-  echo "  ✅ 游戏 QoS 配置完成（方案: $qos_scheme）"
+  if [ "${ADAPTIVE_QOS_MODE:-adaptive}" = "fixed_cake" ]; then
+    echo "  ✅ 游戏 QoS 配置完成（固定 cake 模式，不自动切换）"
+  else
+    echo "  ✅ 游戏 QoS 配置完成（方案: $qos_scheme）"
+  fi
 }
 
 # === 9.11 自适应 QoS（流量高→抢带宽，流量低→游戏低延迟）===
@@ -1812,6 +1822,9 @@ SVCEOF
     grep -q '^ADAPTIVE_QOS=' "$CONFIG_FILE" 2>/dev/null \
       && sed -i "s/^ADAPTIVE_QOS=.*/ADAPTIVE_QOS=1/" "$CONFIG_FILE" \
       || echo "ADAPTIVE_QOS=1" >> "$CONFIG_FILE"
+    grep -q '^ADAPTIVE_QOS_MODE=' "$CONFIG_FILE" 2>/dev/null \
+      && sed -i "s/^ADAPTIVE_QOS_MODE=.*/ADAPTIVE_QOS_MODE=adaptive/" "$CONFIG_FILE" \
+      || echo "ADAPTIVE_QOS_MODE=adaptive" >> "$CONFIG_FILE"
     grep -q '^ADAPTIVE_QOS_IFACE=' "$CONFIG_FILE" 2>/dev/null \
       && sed -i "s/^ADAPTIVE_QOS_IFACE=.*/ADAPTIVE_QOS_IFACE=$iface/" "$CONFIG_FILE" \
       || echo "ADAPTIVE_QOS_IFACE=$iface" >> "$CONFIG_FILE"
@@ -2736,7 +2749,11 @@ print_status() {
   fi
 
   # 自适应 QoS 状态
-  if systemctl is-active "${ADAPTIVE_QOS_SERVICE:-net-optimize-adaptive-qos}" >/dev/null 2>&1; then
+  local _aq_mode=""
+  [ -f "$CONFIG_FILE" ] && _aq_mode="$(grep '^ADAPTIVE_QOS_MODE=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || true)"
+  if [ "${_aq_mode:-adaptive}" = "fixed_cake" ]; then
+    printf "\n📌 QoS 模式：固定 cake（不自动切换，始终游戏低延迟）\n"
+  elif systemctl is-active "${ADAPTIVE_QOS_SERVICE:-net-optimize-adaptive-qos}" >/dev/null 2>&1; then
     printf "\n🔄 自适应 QoS：运行中\n"
     printf "  → 阈值: $(( ${ADAPTIVE_QOS_THRESHOLD:-1048576} / 1024 )) KB/s  采样: ${ADAPTIVE_QOS_INTERVAL:-2}s\n"
     printf "  → 高流量→pfifo_fast(抢带宽)  低流量→cake/prio(游戏低延迟)\n"
