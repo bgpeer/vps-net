@@ -43,10 +43,14 @@ wget -O bbrplus.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/mast
 
 **👉复制以下命令，在 VPS 上粘贴执行：**
 
+**自适应模式**
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
 ```
-
+**固定 cake 模式**
+```bash
+ADAPTIVE_QOS_MODE=fixed_cake bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
+```
 ---
 
 ## 🔍 一键检测当前网络优化状态
