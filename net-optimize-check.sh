@@ -81,13 +81,24 @@ sep
 cc="$(get net.ipv4.tcp_congestion_control)"
 qdisc="$(get net.core.default_qdisc)"
 
+# 优先读取出口网卡实际 qdisc，无法获取时回退到 sysctl 默认值
+_iface_qdisc=""
+if [[ -n "$OUT_IFACE" ]] && has tc; then
+  _iface_qdisc="$(tc qdisc show dev "$OUT_IFACE" root 2>/dev/null | awk '{print $2}' | head -n1)"
+fi
+_display_qdisc="${_iface_qdisc:-$qdisc}"
+
 _aggressive=0
 if [[ -f /etc/net-optimize/config ]] && grep -q 'AGGRESSIVE_MODE=1' /etc/net-optimize/config 2>/dev/null; then _aggressive=1; fi
-[[ "$qdisc" == "pfifo_fast" ]] && [[ "$(get net.core.netdev_max_backlog)" == "1000000" ]] && _aggressive=1
+[[ "$_display_qdisc" == "pfifo_fast" ]] && [[ "$(get net.core.netdev_max_backlog)" == "1000000" ]] && _aggressive=1
 [[ "$_aggressive" -eq 1 ]] && green "⚡ 激进模式：已开启"
 
 [[ "$cc" == bbr* || "$cc" == "bbrplus" ]] && green "✅ 拥塞算法：$cc" || yellow "⚠️ 拥塞算法：$cc（非 BBR 系列）"
-green "✅ 默认队列：$qdisc"
+if [[ -n "$_iface_qdisc" ]]; then
+  green "✅ 当前队列（${OUT_IFACE}）：$_iface_qdisc"
+else
+  green "✅ 默认队列：$qdisc"
+fi
 has_key net.ipv4.tcp_mtu_probing && green "✅ TCP MTU 探测：$(get net.ipv4.tcp_mtu_probing)"
 
 echo "✅ TCP 参数："
