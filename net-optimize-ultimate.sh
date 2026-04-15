@@ -1351,7 +1351,19 @@ setup_game_qos() {
   # === 方案选择：优先 cake，fallback prio ===
   local qos_scheme="none"
 
-  # 检测 cake 是否可用
+  # 检测 cake 是否可用，不可用时尝试安装内核模块
+  if ! modprobe sch_cake 2>/dev/null; then
+    echo "  ℹ️ sch_cake 模块未加载，尝试安装 linux-modules-extra..."
+    local kern
+    kern="$(uname -r)"
+    if apt-get install -y -qq "linux-modules-extra-${kern}" 2>/dev/null; then
+      echo "  ✅ linux-modules-extra-${kern} 安装成功，重新加载 sch_cake"
+      modprobe sch_cake 2>/dev/null || true
+    else
+      echo "  ℹ️ linux-modules-extra-${kern} 不可用，跳过（将使用方案 B）"
+    fi
+  fi
+
   if modprobe sch_cake 2>/dev/null; then
     # 试挂 cake，如果成功就用 cake
     if tc qdisc replace dev "$iface" root cake bandwidth unlimited diffserv4 nat nowash no-split-gso 2>/dev/null; then
@@ -1474,7 +1486,7 @@ setup_adaptive_qos() {
   iface="$(detect_outbound_iface 2>/dev/null || true)"
   [ -z "$iface" ] && { echo "  ⚠️ 无法检测出口网卡，跳过"; return 0; }
 
-  # 检测 cake 可用性
+  # 检测 cake 可用性（已由 setup_game_qos 尝试安装，此处直接检测）
   local has_cake=0
   if modprobe sch_cake 2>/dev/null; then
     has_cake=1
