@@ -14,14 +14,10 @@ WHITELIST_TAGS=(
   "tiktok"
   "wildrift"
   "bilibili"
-  "zhihu"
   "xiaohongshu"
-  "baidu"
   "alibaba"
   "tencent"
-  "jd"
-  "netease"
-  "sina"
+  "kuaishou"
 )
 
 # ===== 广告屏蔽规则集（按需增减，对应 .srs 文件名）=====
