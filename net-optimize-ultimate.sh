@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.7.2
+# 🚀 Net-Optimize-Ultimate v3.7.3
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
 # v3.7.0 新增：
 #   1) BBRv2/BBRv3 自动检测（内核支持时优先启用）
@@ -105,7 +105,7 @@ install -Dm755 "$0" "$SCRIPT_PATH" 2>/dev/null || true
 
 trap 'code=$?; echo "❌ 出错：第 ${BASH_LINENO[0]} 行 -> ${BASH_COMMAND} (退出码 $code)"; exit $code' ERR
 
-echo "🚀 Net-Optimize-Ultimate v3.7.1 开始执行..."
+echo "🚀 Net-Optimize-Ultimate v3.7.3 开始执行..."
 echo "========================================================"
 
 # === 2. 全局配置开关 ===
@@ -1621,8 +1621,19 @@ class AdaptiveQoS:
         self.has_cake      = conf.get("has_cake", False)
         self.has_length     = conf.get("has_length", False)
         self.has_length_ip6 = conf.get("has_length_ip6", conf.get("has_length", False))
-        self.ipt            = conf.get("ipt_backend", "")
-        self.ip6            = conf.get("ip6_cmd", "")
+        self.ipt            = conf.get("ipt_backend") or ""
+        self.ip6            = conf.get("ip6_cmd") or ""
+        # 若配置缺失，自动检测可用后端
+        if not self.ipt:
+            for _c in ("iptables", "iptables-legacy", "iptables-nft"):
+                if has_cmd(_c):
+                    self.ipt = _c
+                    break
+        if not self.ip6:
+            for _c in ("ip6tables", "ip6tables-legacy", "ip6tables-nft"):
+                if has_cmd(_c):
+                    self.ip6 = _c
+                    break
         self.mode          = "unknown"  # game / aggressive / unknown
 
     # ---- tc: 游戏低延迟 ----
@@ -1674,8 +1685,14 @@ class AdaptiveQoS:
         opts_len = ("-p udp ! --dport 443 -m length --length 0:200 "
                     "-j DSCP --set-dscp-class AF41")
         opts_nolen = "-p udp ! --dport 443 -j DSCP --set-dscp-class AF41"
-        if self.ipt and has_cmd(self.ipt) and self.has_length:
-            run(f"{self.ipt} -t mangle -A POSTROUTING -o {self.iface} {opts_len}")
+        if self.ipt and has_cmd(self.ipt):
+            if self.has_length:
+                r = run(f"{self.ipt} -t mangle -A POSTROUTING -o {self.iface} {opts_len}")
+                if r.returncode != 0:
+                    # -m length 不支持时降级为不带长度过滤的规则
+                    run(f"{self.ipt} -t mangle -A POSTROUTING -o {self.iface} {opts_nolen}")
+            else:
+                run(f"{self.ipt} -t mangle -A POSTROUTING -o {self.iface} {opts_nolen}")
         if self.ip6 and has_cmd(self.ip6):
             if self.has_length_ip6:
                 r = run(f"{self.ip6} -t mangle -A POSTROUTING -o {self.iface} {opts_len}")
