@@ -1366,7 +1366,7 @@ setup_game_qos() {
 
   if modprobe sch_cake 2>/dev/null; then
     # 试挂 cake，如果成功就用 cake
-    if tc qdisc replace dev "$iface" root cake bandwidth unlimited diffserv4 nat nowash no-split-gso 2>/dev/null; then
+    if tc qdisc replace dev "$iface" root cake diffserv4 nat nowash no-split-gso 2>/dev/null; then
       qos_scheme="cake"
       echo "  ✅ 方案 A：cake diffserv4 已启用"
       echo "    → 4 档优先级自动分流（Bulk/Best Effort/Video/Voice）"
@@ -1627,8 +1627,7 @@ class AdaptiveQoS:
 
     # ---- tc: 游戏低延迟 ----
     def _apply_cake(self) -> bool:
-        r = run(f"tc qdisc replace dev {self.iface} root cake bandwidth unlimited "
-                f"diffserv4 nat nowash no-split-gso")
+        r = run(f"tc qdisc replace dev {self.iface} root cake diffserv4 nat nowash no-split-gso")
         return r.returncode == 0
 
     def _apply_prio(self):
@@ -2436,7 +2435,7 @@ if [ -f "$CONFIG_FILE" ]; then
   if [ "$_qos_scheme" = "cake" ]; then
     modprobe sch_cake 2>/dev/null || true
     if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
-      tc qdisc replace dev "$IFACE" root cake bandwidth unlimited diffserv4 nat nowash no-split-gso 2>/dev/null || true
+      tc qdisc replace dev "$IFACE" root cake diffserv4 nat nowash no-split-gso 2>/dev/null || true
     fi
   elif [ "$_qos_scheme" = "prio" ]; then
     if [ -n "$IFACE" ] && [ "$IFACE" != "unknown" ]; then
