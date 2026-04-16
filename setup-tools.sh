@@ -13,10 +13,30 @@ else
   fi
 fi
 
-APT="$SUDO apt-get"
+APT="$SUDO apt-get -o DPkg::Lock::Timeout=300"
 export DEBIAN_FRONTEND=noninteractive
 
 declare -a FAILED_PKGS=()
+
+# 等待后台 apt/dpkg 进程（如 unattended-upgrades）释放锁
+wait_apt_lock() {
+  local locks="/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock"
+  local elapsed=0
+  # shellcheck disable=SC2086
+  if fuser $locks >/dev/null 2>&1; then
+    echo "⏳ 检测到系统后台 apt 正在运行，等待锁释放（最多 300s）..."
+    while fuser $locks >/dev/null 2>&1; do
+      sleep 5
+      elapsed=$((elapsed + 5))
+      [ $((elapsed % 30)) -eq 0 ] && echo "   仍在等待...（已等 ${elapsed}s）"
+      if [ $elapsed -ge 300 ]; then
+        echo "❌ 等待 apt 锁超时（300s），请稍后重试或手动 kill apt 进程后再运行本脚本"
+        exit 1
+      fi
+    done
+    echo "✅ apt 锁已释放，继续执行（共等待 ${elapsed}s）"
+  fi
+}
 
 install_one() {
   local pkg="$1"
@@ -53,6 +73,7 @@ ask_yn() {
   done
 }
 
+wait_apt_lock
 echo "🔹 更新软件包索引..."
 $APT update -y || { echo "❌ apt update 失败，退出"; exit 1; }
 
