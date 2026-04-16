@@ -51,12 +51,14 @@ for ib in cfg.get("inbounds", []):
     if any(u.get("flow") == "xtls-rprx-vision" for u in ib.get("users", [])):
         skipped.append(f"{tag}（Vision flow 不兼容）")
         continue
-    if "multiplex" in ib:
-        skipped.append(f"{tag}（已存在，跳过）")
+    existing = ib.get("multiplex", {})
+    if existing.get("enabled") is True:
+        skipped.append(f"{tag}（已启用，跳过）")
         continue
-
+    # enabled=false 或不存在时，覆盖写入
+    action = "覆盖（原为 disabled）" if "multiplex" in ib else "新增"
     ib["multiplex"] = MUX_CFG
-    added.append(f"{tag}（{t}+{tr or 'tcp'}）")
+    added.append(f"{tag}（{t}+{tr or 'tcp'}，{action}）")
 
 print(f"\n➕ 添加 multiplex（{len(added)} 个）：")
 for s in added:
