@@ -89,6 +89,12 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-
 ```
 代码跑完之后建议把所有的连接信息复制下来保存到**谷歌文档**，方便以后提取
 
+**VL_WS / VM_WS / VM_HTTPUpgrade_TLS叠加**
+
+```bash
+python3 <(curl -sL https://raw.githubusercontent.com/bgpeer/vps-net/main/scripts/enable-multiplex.py)
+```
+
 **如果创建了屏蔽大陆域名，下面是放行白名单规则集脚本**
 
 ```bash
