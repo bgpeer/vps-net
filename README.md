@@ -47,7 +47,7 @@ wget -O bbrplus.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/mast
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
 ```
-**自适应抢占带宽模式（流量达到10m/s激活）**
+**自适应抢占带宽模式（流量达到10m/s激活）**（阀值可调）
 ```bash
 ADAPTIVE_QOS_THRESHOLD=10485760 bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
 ```
