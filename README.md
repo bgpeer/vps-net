@@ -43,7 +43,7 @@ wget -O bbrplus.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/mast
 
 **👉复制以下命令，在 VPS 上粘贴执行：**
 
-**自适应模式**
+**自适应抢占带宽模式**
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
 ```
