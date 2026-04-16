@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 🧹 Net-Optimize 完整卸载/重置脚本
-# 配合 net-optimize-ultimate.sh v3.5.0 使用
+# 配合 net-optimize-ultimate.sh v3.7.4 使用
 # 清除所有优化配置，恢复系统默认状态
 # ==============================================================================
 set -euo pipefail
@@ -17,11 +17,33 @@ systemctl stop net-optimize.service 2>/dev/null || true
 systemctl disable net-optimize.service 2>/dev/null || true
 rm -f /etc/systemd/system/net-optimize.service
 rm -f /usr/local/sbin/net-optimize-apply
-systemctl daemon-reload 2>/dev/null || true
 echo "  ✅ 已移除 net-optimize.service"
 
-# === 2. 清理 iptables / ip6tables 规则（TCPMSS + DSCP，所有后端）===
-echo "🔧 [2] 清理 iptables 规则（TCPMSS + DSCP）..."
+# 自适应 QoS 守护进程
+systemctl stop net-optimize-adaptive-qos.service 2>/dev/null || true
+systemctl disable net-optimize-adaptive-qos.service 2>/dev/null || true
+rm -f /etc/systemd/system/net-optimize-adaptive-qos.service
+rm -f /usr/local/sbin/net-optimize-adaptive-qos
+echo "  ✅ 已移除 net-optimize-adaptive-qos.service"
+
+systemctl daemon-reload 2>/dev/null || true
+
+# === 2. 重置网卡 tc qdisc ===
+echo "🔧 [2] 重置网卡 tc qdisc..."
+_reset_iface=""
+_reset_iface=$(ip -4 route get 1.1.1.1 2>/dev/null \
+  | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}' | head -n1 || true)
+[ -z "$_reset_iface" ] && _reset_iface=$(ip route show default 2>/dev/null \
+  | awk '/default/{print $5}' | head -n1 || true)
+if [ -n "$_reset_iface" ] && command -v tc >/dev/null 2>&1; then
+  tc qdisc del dev "$_reset_iface" root 2>/dev/null || true
+  echo "  ✅ 已重置 $_reset_iface qdisc（恢复内核默认）"
+else
+  echo "  ℹ️ 无法检测出口网卡，跳过 qdisc 重置"
+fi
+
+# === 3. 清理 iptables / ip6tables 规则（TCPMSS + DSCP，所有后端）===
+echo "🔧 [3] 清理 iptables 规则（TCPMSS + DSCP）..."
 for cmd in iptables iptables-legacy iptables-nft ip6tables ip6tables-legacy ip6tables-nft; do
   command -v "$cmd" >/dev/null 2>&1 || continue
   local_rules="$("$cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -E 'TCPMSS|DSCP' || true)"
@@ -43,8 +65,8 @@ for cmd in iptables iptables-legacy; do
 done
 echo "  ✅ 已清理 conntrack INVALID DROP 规则"
 
-# === 3. 清理 sysctl 配置 ===
-echo "🔧 [3] 清理 sysctl 配置..."
+# === 4. 清理 sysctl 配置 ===
+echo "🔧 [4] 清理 sysctl 配置..."
 rm -f /etc/sysctl.d/99-net-optimize.conf
 rm -f /etc/sysctl.d/zzz-net-optimize-override.conf
 echo "  ✅ 已删除 sysctl 配置文件"
@@ -74,27 +96,27 @@ fi
 sysctl --system >/dev/null 2>&1 || true
 echo "  ✅ sysctl 已重新加载"
 
-# === 4. 清理 ulimit / limits.d ===
-echo "🔧 [4] 清理 ulimit 配置..."
+# === 5. 清理 ulimit / limits.d ===
+echo "🔧 [5] 清理 ulimit 配置..."
 rm -f /etc/security/limits.d/99-net-optimize.conf
 # 清理 systemd DefaultLimitNOFILE
 sed -i '/^DefaultLimitNOFILE/d' /etc/systemd/system.conf 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 echo "  ✅ 已清理 ulimit 配置"
 
-# === 5. 清理 conntrack 模块加载 ===
-echo "🔧 [5] 清理 conntrack 配置..."
+# === 6. 清理 conntrack 模块加载 ===
+echo "🔧 [6] 清理 conntrack 配置..."
 rm -f /etc/modules-load.d/conntrack.conf
 echo "  ✅ 已删除 conntrack 模块开机加载配置"
 
-# === 6. 清理 NIC offload / RPS/RFS 持久化 ===
-echo "🔧 [6] 清理网卡持久化配置..."
+# === 7. 清理 NIC offload / RPS/RFS 持久化 ===
+echo "🔧 [7] 清理网卡持久化配置..."
 rm -f /etc/udev/rules.d/99-net-optimize-offload.rules
 rm -f /etc/tmpfiles.d/net-optimize-rps.conf
 echo "  ✅ 已删除 offload/RPS/RFS 持久化规则"
 
-# === 7. 清理 initcwnd 路由参数 ===
-echo "🔧 [7] 清理 initcwnd 路由参数..."
+# === 8. 清理 initcwnd 路由参数 ===
+echo "🔧 [8] 清理 initcwnd 路由参数..."
 _strip_route_params() {
   echo "$1" | sed -E \
     's/ initcwnd [0-9]+//g;
@@ -120,21 +142,21 @@ if [ -n "$dgw6" ] && echo "$dgw6" | grep -q 'initcwnd'; then
   echo "  ✅ 已清除 IPv6 initcwnd"
 fi
 
-# === 8. 清理 Nginx 自动更新 cron ===
-echo "🔧 [8] 清理 Nginx 自动更新 cron..."
+# === 9. 清理 Nginx 自动更新 cron ===
+echo "🔧 [9] 清理 Nginx 自动更新 cron..."
 rm -f /etc/cron.d/net-optimize-nginx-update
 echo "  ✅ 已删除 Nginx 自动更新 cron"
 
-# === 9. 删除配置目录和主脚本 ===
-echo "🔧 [9] 删除脚本和配置..."
+# === 10. 删除配置目录和主脚本 ===
+echo "🔧 [10] 删除脚本和配置..."
 rm -rf /etc/net-optimize
 rm -f /usr/local/sbin/net-optimize-ultimate.sh
 # 备份目录
 rm -rf /etc/net-optimize-backup
 echo "  ✅ 已删除 /etc/net-optimize 和主脚本"
 
-# === 10. 清理 sysctl 备份目录 ===
-echo "🔧 [10] 清理备份..."
+# === 11. 清理 sysctl 备份目录 ===
+echo "🔧 [11] 清理备份..."
 rm -rf /etc/net-optimize-backup 2>/dev/null || true
 echo "  ✅ 已清理备份目录"
 
