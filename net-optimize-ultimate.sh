@@ -129,7 +129,7 @@ echo "========================================================"
 : "${ENABLE_GAME_QOS:=1}"      # 游戏低延迟 QoS（cake/prio 双方案自动选择）
 : "${ADAPTIVE_QOS:=1}"         # 自适应 QoS：流量高→抢带宽，流量低→游戏低延迟（自动切换）
 : "${ADAPTIVE_QOS_MODE:=adaptive}"      # QoS 模式: adaptive=自适应切换 / fixed_cake=固定 cake 不切换
-: "${ADAPTIVE_QOS_THRESHOLD:=20971520}"  # 自适应阈值（字节/秒，默认 20MB/s）
+: "${ADAPTIVE_QOS_THRESHOLD:=10485760}"  # 自适应阈值（字节/秒，默认 10MB/s）
 : "${ADAPTIVE_QOS_INTERVAL:=2}"         # 采样间隔（秒）
 : "${ADAPTIVE_QOS_COOLDOWN:=10}"        # 抢带宽冷却时间（秒，流量降下后多久切回游戏模式）
 # fixed_cake 模式：强制关闭自适应守护，走 setup_game_qos 固定 cake
