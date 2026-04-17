@@ -51,7 +51,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-opti
 ```bash
 ADAPTIVE_QOS_THRESHOLD=20971520 bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
 ```
-**固定 cake 智能算法模式适合高性能机器用户**
+**固定 cake 纯智能算法模式适合高性能机器用户**
 ```bash
 ADAPTIVE_QOS_MODE=fixed_cake bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize-ultimate.sh)
 ```
