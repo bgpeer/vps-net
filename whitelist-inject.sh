@@ -1,8 +1,9 @@
 #!/bin/bash
-# whitelist-inject.sh v2.1
+# whitelist-inject.sh v2.2
 # 在 v2ray-agent sing-box 屏蔽中国域名/IP 规则前注入白名单放行规则，并屏蔽广告
 # 用法: bash whitelist-inject.sh
 # 注意: 每次 vasma 修改配置后需重新执行
+# 功能: 首次运行后自动安装 cron，每天北京时间 03:00 自动刷新规则集
 
 CONFIG="/etc/v2ray-agent/sing-box/conf/config.json"
 SINGBOX_BIN="/etc/v2ray-agent/sing-box/sing-box"
@@ -31,7 +32,46 @@ AD_BLOCK_OUTBOUND="block_ip_outbound"
 # 规则集 URL 前缀
 URL_PREFIX="https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite"
 
+# ===== 定时刷新相关路径 =====
+SCRIPT_INSTALL="/usr/local/sbin/whitelist-inject.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelist-inject.sh"
+CRON_FILE="/etc/cron.d/whitelist-inject"
+CRON_LOG="/var/log/whitelist-inject.log"
+
 # ================================================================
+
+# 安装/更新每日自动刷新 cron 任务
+setup_auto_refresh() {
+  echo ""
+  echo "[定时] 配置每日自动刷新（北京时间 03:00）..."
+
+  # 将脚本保存到固定路径，供 cron 调用
+  # 通过管道运行时 $0 不是真实文件，从 GitHub 下载
+  if [[ -f "$0" ]]; then
+    cp "$0" "$SCRIPT_INSTALL"
+  else
+    if ! curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_INSTALL"; then
+      echo "[警告] 下载脚本失败，跳过定时任务安装"
+      return 0
+    fi
+  fi
+  chmod 755 "$SCRIPT_INSTALL"
+
+  # UTC 19:00 = 北京时间 03:00（CST = UTC+8）
+  cat > "$CRON_FILE" <<EOF
+# whitelist-inject 规则集每日自动刷新
+# 执行时间: 北京时间 03:00（UTC 19:00）
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+0 19 * * * root $SCRIPT_INSTALL >> $CRON_LOG 2>&1
+EOF
+  chmod 644 "$CRON_FILE"
+
+  echo "[定时] ✓ 定时任务已安装"
+  echo "       时间: 每天北京时间 03:00（UTC 19:00）"
+  echo "       脚本: $SCRIPT_INSTALL"
+  echo "       日志: $CRON_LOG"
+}
 
 set -e
 
@@ -211,6 +251,7 @@ for i in $(seq 1 30); do
   sleep 2
   if systemctl is-active --quiet sing-box; then
     echo "[完成] sing-box 运行中 ✓（等待了 $((i*2)) 秒）"
+    setup_auto_refresh
     exit 0
   fi
 done
