@@ -506,7 +506,7 @@ maybe_install_tools() {
   local packages=""
   packages+=" ca-certificates curl wget gnupg2 lsb-release"
   packages+=" ethtool iproute2 irqbalance chrony"
-  packages+=" nftables conntrack iptables"
+  packages+=" nftables conntrack iptables iptables-persistent"
   packages+=" software-properties-common apt-transport-https"
 
   # shellcheck disable=SC2086
@@ -2687,6 +2687,12 @@ logger -t net-optimize "initcwnd=${_cwnd} re-applied on ${IFACE:-unknown} (netwo
 NDEOF
   chmod +x "${_nd_dir}/50-initcwnd"
   echo "✅ networkd-dispatcher hook 已安装（DHCP 续约自动恢复 initcwnd）"
+
+  # 持久化当前 iptables 规则（保留 nat 表中的端口跳跃规则，供开机恢复用）
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    echo "✅ iptables 规则已持久化（nat 端口跳跃将在重启后自动恢复）"
+  fi
 
   echo "✅ 开机自启服务配置完成"
 }
