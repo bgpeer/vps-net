@@ -2228,22 +2228,25 @@ EOF
     local has_ondrej=0
     if ls /etc/apt/sources.list.d/*ondrej*nginx* >/dev/null 2>&1; then
       has_ondrej=1
-    else
-      if grep -R "ppa.launchpadcontent.net/ondrej/nginx" /etc/apt/sources.list.d >/dev/null 2>&1; then
-        has_ondrej=1
-      fi
+    elif grep -R "ppa.launchpadcontent.net/ondrej/nginx" /etc/apt/sources.list.d >/dev/null 2>&1; then
+      has_ondrej=1
     fi
 
     if [ "$has_ondrej" = "1" ]; then
-      echo "ℹ️ 已检测到 ondrej/nginx PPA 源（共存保留）"
-    else
-      add-apt-repository -y ppa:ondrej/nginx >/dev/null 2>&1 || true
-      if grep -R "ppa.launchpadcontent.net/ondrej/nginx" /etc/apt/sources.list.d >/dev/null 2>&1; then
-        echo "✅ 已添加 ondrej/nginx PPA 源（共存备胎）"
+      # 验证 PPA 是否仍可用（Noble 上已 404，会污染每次 apt update）
+      local _codename; _codename="$(lsb_release -sc 2>/dev/null || echo 'noble')"
+      if curl -fsSL --max-time 8 \
+          "https://ppa.launchpadcontent.net/ondrej/nginx/ubuntu/dists/${_codename}/Release" \
+          >/dev/null 2>&1; then
+        echo "ℹ️ 已检测到 ondrej/nginx PPA 源（可用，共存保留）"
       else
-        echo "⚠️ ondrej/nginx PPA 添加失败：继续（不影响主流程）"
+        # PPA 已失效，清理所有相关文件避免 apt update 报错
+        find /etc/apt/sources.list.d -maxdepth 1 \
+          \( -name '*ondrej*nginx*' -o -name '*ondrej*' \) -delete 2>/dev/null || true
+        echo "ℹ️ ondrej/nginx PPA 已失效（404），已自动移除，使用 nginx.org 官方源"
       fi
     fi
+    # PPA 不存在时不再尝试添加，nginx.org 官方源已满足需求
   else
     echo "ℹ️ 非 Ubuntu：跳过 ondrej/nginx PPA（仍保留 nginx.org 官方源）"
   fi
