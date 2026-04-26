@@ -2648,6 +2648,46 @@ EOF
   systemctl daemon-reload
   systemctl enable net-optimize.service >/dev/null 2>&1
 
+  # === networkd-dispatcher hook（DHCP 续约后自动恢复 initcwnd）===
+  # DHCP 续约时内核会重装默认路由，丢失 initcwnd 属性；此 hook 在接口变为
+  # routable 状态时自动重新应用，无需重启。
+  local _nd_dir="/etc/networkd-dispatcher/routable.d"
+  mkdir -p "$_nd_dir"
+  cat > "${_nd_dir}/50-initcwnd" <<'NDEOF'
+#!/usr/bin/env bash
+# networkd-dispatcher hook: re-apply initcwnd/initrwnd after DHCP renewal
+CONFIG_FILE="/etc/net-optimize/config"
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+[ "${ENABLE_INITCWND:-1}" != "1" ] && exit 0
+_cwnd="${INITCWND:-20}"
+[ "${_cwnd}" = "0" ] && exit 0
+
+_strip_route_params() {
+  echo "$1" | sed -E \
+    's/ initcwnd [0-9]+//g;
+     s/ initrwnd [0-9]+//g;
+     s/ expires [0-9]+sec//g;
+     s/ hoplimit [0-9]+//g;
+     s/ pref [a-z]+//g'
+}
+
+_dgw="$(ip -4 route show default 2>/dev/null | head -n1 || true)"
+if [ -n "$_dgw" ]; then
+  _dgw_clean="$(_strip_route_params "$_dgw")"
+  ip route change $_dgw_clean initcwnd "$_cwnd" initrwnd "$_cwnd" 2>/dev/null || true
+fi
+
+_dgw6="$(ip -6 route show default 2>/dev/null | head -n1 || true)"
+if [ -n "$_dgw6" ]; then
+  _dgw6_clean="$(_strip_route_params "$_dgw6")"
+  ip -6 route change $_dgw6_clean initcwnd "$_cwnd" initrwnd "$_cwnd" 2>/dev/null || true
+fi
+
+logger -t net-optimize "initcwnd=${_cwnd} re-applied on ${IFACE:-unknown} (networkd-dispatcher)"
+NDEOF
+  chmod +x "${_nd_dir}/50-initcwnd"
+  echo "✅ networkd-dispatcher hook 已安装（DHCP 续约自动恢复 initcwnd）"
+
   echo "✅ 开机自启服务配置完成"
 }
 
