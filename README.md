@@ -24,7 +24,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/bgpeer/vps-net/main/setup-too
 
 **📢适用于 RAM 足够的 KVM VPS**
 
-**🚫⚠ AMD 核心 VPS 请勿安装，否则可能会死机！**
+**🚫⚠ 安装时确保自己机器可以重装或者里面没有重要资料再试，有些机器性能差或权限不够可能会死机！**
 
 ```bash
 wget -O bbrplus.sh https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcp.sh && chmod +x bbrplus.sh && ./bbrplus.sh
