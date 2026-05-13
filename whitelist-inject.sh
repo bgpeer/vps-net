@@ -279,14 +279,6 @@ done
 
 TMP_CONFIG="$(mktemp)"
 
-# 注入并整理 route.rules 顺序：
-# [0] sniff
-# [1] 原有放行/其它前置规则，例如 Apple 放行
-# [2] 白名单放行
-# [3] 广告屏蔽
-# [4] 中国域名屏蔽
-# [5] 中国 IP 屏蔽
-# [6] 原本在 CN 屏蔽后面的其它规则，保持在后面
 jq --argjson wl_rsets "$WL_RSETS_JSON" \
    --argjson wl_refs  "$WL_REFS_JSON"  \
    --argjson ad_rsets "$AD_RSETS_JSON" \
@@ -294,29 +286,6 @@ jq --argjson wl_rsets "$WL_RSETS_JSON" \
    --arg     direct_out "$DIRECT_OUTBOUND" \
    --arg     block_out  "$BLOCK_OUTBOUND" \
    '
-   def arr(x): if (x|type)=="array" then x else [x] end;
-   def refs: if .rule_set? then arr(.rule_set) else [] end;
-
-   def is_sniff:
-     .action? == "sniff";
-
-   def is_cn_domain_block:
-     (.rule_set? != null) and
-     (refs | any(
-       . == "cn_cn_block_route" or
-       test("(^|[-_])geosite[-_]?cn($|[-_])"; "i") or
-       test("^cn[_-]cn[_-]block[_-]route$"; "i") or
-       test("(^|[-_])cn[-_]?block[-_]?route$"; "i")
-     ));
-
-   def is_cn_ip_block:
-     (.rule_set? != null) and
-     (refs | any(
-       . == "geoip_cn_cn_block_ip_route" or
-       test("(^|[-_])geoip[-_]?cn($|[-_])"; "i") or
-       test("cn[-_]?block[-_]?ip"; "i")
-     ));
-
    .route //= {} |
    .route.rule_set //= [] |
    .route.rules //= [] |
@@ -324,29 +293,21 @@ jq --argjson wl_rsets "$WL_RSETS_JSON" \
    .route.rule_set += $wl_rsets + $ad_rsets |
 
    .route.rules as $rules |
-
    (
-     $rules
-     | to_entries
-     | map(select(.value | (is_cn_domain_block or is_cn_ip_block)))
-     | .[0].key // ($rules | length)
-   ) as $cn_idx |
-
-   ($rules | map(select(is_sniff))) as $sniff_rules |
-   ($rules | map(select(is_cn_domain_block))) as $cn_domain_rules |
-   ($rules | map(select(is_cn_ip_block))) as $cn_ip_rules |
-
-   ($rules[:$cn_idx] | map(select((is_sniff or is_cn_domain_block or is_cn_ip_block) | not))) as $before_cn |
-   ($rules[$cn_idx:] | map(select((is_sniff or is_cn_domain_block or is_cn_ip_block) | not))) as $after_cn |
+     $rules | to_entries | map(select(
+       .value.rule_set? == "cn_cn_block_route" or
+       .value.rule_set? == "geoip_cn_cn_block_ip_route" or
+       ((.value.rule_set? | type) == "array" and (
+         .value.rule_set | any(. == "cn_cn_block_route" or . == "geoip_cn_cn_block_ip_route")
+       ))
+     )) | .[0].key // 1
+   ) as $idx |
 
    .route.rules = (
-     $sniff_rules +
-     $before_cn +
+     $rules[:$idx] +
      (if ($wl_refs | length) > 0 then [{"rule_set": $wl_refs, "outbound": $direct_out}] else [] end) +
      (if ($ad_refs | length) > 0 then [{"rule_set": $ad_refs, "outbound": $block_out}] else [] end) +
-     $cn_domain_rules +
-     $cn_ip_rules +
-     $after_cn
+     $rules[$idx:]
    )
    ' "$CONFIG" > "$TMP_CONFIG"
 
@@ -360,22 +321,16 @@ echo "[完成] 注入成功！"
 echo ""
 
 echo "当前路由规则顺序:"
-jq -r '
-  (.route.rules // []) as $rules |
-  range(0; $rules|length) as $i |
-  $rules[$i] as $r |
-  if $r.rule_set then
-    "  [" + ($i|tostring) + "] rule_set=" +
-    (if ($r.rule_set|type)=="array" then ($r.rule_set|join(",")) else $r.rule_set end) +
-    "  outbound=" + ($r.outbound // "-")
-  elif $r.domain_regex then
-    "  [" + ($i|tostring) + "] domain_regex (" + (($r.domain_regex|length)|tostring) + " 条)  outbound=" + ($r.outbound // "-")
-  elif $r.action then
-    "  [" + ($i|tostring) + "] action=" + $r.action
+jq -r '(.route.rules // [])[] |
+  if .rule_set then
+    "  → rule_set: \(if (.rule_set|type)=="array" then (.rule_set|join(",")) else .rule_set end) → \(.outbound // "-")"
+  elif .domain_regex then
+    "  → domain_regex (\(.domain_regex|length) 条) → \(.outbound // "-")"
+  elif .action then
+    "  → action: \(.action)"
   else
-    "  [" + ($i|tostring) + "] " + ($r|tostring)
-  end
-' "$CONFIG"
+    "  → \(.)"
+  end' "$CONFIG"
 
 echo ""
 
