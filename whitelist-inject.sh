@@ -1,9 +1,12 @@
+cat > /usr/local/sbin/whitelist-inject.sh <<'EOF'
 #!/bin/bash
-# whitelist-inject.sh v2.2
+# whitelist-inject.sh v2.3
 # 在 v2ray-agent sing-box 屏蔽中国域名/IP 规则前注入白名单放行规则，并屏蔽广告
 # 用法: bash whitelist-inject.sh
 # 注意: 每次 vasma 修改配置后需重新执行
 # 功能: 首次运行后自动安装 cron，每天北京时间 03:00 自动刷新规则集
+
+set -Eeuo pipefail
 
 CONFIG="/etc/v2ray-agent/sing-box/conf/config.json"
 SINGBOX_BIN="/etc/v2ray-agent/sing-box/sing-box"
@@ -32,11 +35,21 @@ AD_BLOCK_OUTBOUND="block_ip_outbound"
 # 规则集 URL 前缀
 URL_PREFIX="https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite"
 
+# 规则集下载使用的出站
+DOWNLOAD_DETOUR="01_direct_outbound"
+
 # ===== 定时刷新相关路径 =====
 SCRIPT_INSTALL="/usr/local/sbin/whitelist-inject.sh"
 SCRIPT_URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelist-inject.sh"
 CRON_FILE="/etc/cron.d/whitelist-inject"
 CRON_LOG="/var/log/whitelist-inject.log"
+
+# 临时文件
+TMP_CONFIG=""
+cleanup() {
+  [[ -n "${TMP_CONFIG:-}" && -f "$TMP_CONFIG" ]] && rm -f "$TMP_CONFIG"
+}
+trap cleanup EXIT
 
 # ================================================================
 
@@ -45,9 +58,10 @@ setup_auto_refresh() {
   echo ""
   echo "[定时] 配置每日自动刷新（北京时间 03:00）..."
 
-  # 将脚本保存到固定路径，供 cron 调用
-  # 通过管道运行时 $0 不是真实文件，从 GitHub 下载
-  if [[ -f "$0" ]]; then
+  mkdir -p "$(dirname "$SCRIPT_INSTALL")"
+
+  # 通过 bash <(curl ...) 运行时，$0 通常是 /dev/fd/xx，不适合直接复制，优先重新下载正式脚本
+  if [[ -f "$0" && "$0" != /dev/fd/* && "$0" != /proc/* && "$0" != "bash" ]]; then
     cp "$0" "$SCRIPT_INSTALL"
   else
     if ! curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_INSTALL"; then
@@ -57,12 +71,13 @@ setup_auto_refresh() {
   fi
   chmod 755 "$SCRIPT_INSTALL"
 
-  # UTC 19:00 = 北京时间 03:00（CST = UTC+8）
+  # CRON_TZ=UTC：不受系统时区影响；UTC 19:00 = 北京时间 03:00
   cat > "$CRON_FILE" <<EOF
 # whitelist-inject 规则集每日自动刷新
 # 执行时间: 北京时间 03:00（UTC 19:00）
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+CRON_TZ=UTC
 0 19 * * * root $SCRIPT_INSTALL >> $CRON_LOG 2>&1
 EOF
   chmod 644 "$CRON_FILE"
@@ -73,7 +88,11 @@ EOF
   echo "       日志: $CRON_LOG"
 }
 
-set -e
+# 检查出站标签是否存在
+has_outbound() {
+  local tag="$1"
+  jq -e --arg tag "$tag" 'any(.outbounds[]?; .tag == $tag)' "$CONFIG" >/dev/null
+}
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "[错误] 配置文件不存在: $CONFIG"
@@ -90,6 +109,18 @@ if ! command -v jq &>/dev/null; then
   apt-get update -qq && apt-get install -y -qq jq
 fi
 
+if ! jq empty "$CONFIG" >/dev/null 2>&1; then
+  echo "[错误] 当前配置不是合法 JSON: $CONFIG"
+  exit 1
+fi
+
+# 检查必要出站，避免注入后 check 失败再回滚
+if ! has_outbound "$DOWNLOAD_DETOUR"; then
+  echo "[错误] 配置中找不到下载用出站标签: $DOWNLOAD_DETOUR"
+  echo "       请先用 jq -r '.outbounds[].tag' $CONFIG 查看实际出站名称"
+  exit 1
+fi
+
 # 预检函数：过滤不存在的规则集（HTTP 非 200 则跳过）
 # 诊断信息全部输出到 stderr，stdout 只输出有效标签列表（供 $() 捕获）
 precheck_tags() {
@@ -98,11 +129,16 @@ precheck_tags() {
   local tags=("$@")
   local valid=()
   local skip=()
+  local status=""
+  local url=""
 
   echo "[信息] 预检${label}规则集..." >&2
   for tag in "${tags[@]}"; do
-    status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
-      "${URL_PREFIX}/${tag}.srs")
+    url="${URL_PREFIX}/${tag}.srs"
+    if ! status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$url" 2>/dev/null); then
+      status="000"
+    fi
+
     if [[ "$status" == "200" ]]; then
       valid+=("$tag")
     else
@@ -132,61 +168,97 @@ if [[ ${#VALID_WL[@]} -eq 0 && ${#VALID_AD[@]} -eq 0 ]]; then
   exit 1
 fi
 
+if [[ ${#VALID_AD[@]} -gt 0 ]] && ! has_outbound "$AD_BLOCK_OUTBOUND"; then
+  echo "[错误] 配置中找不到广告屏蔽出站标签: $AD_BLOCK_OUTBOUND"
+  echo "       请先用 jq -r '.outbounds[].tag' $CONFIG 查看实际出站名称"
+  exit 1
+fi
+
 # 备份
 cp "$CONFIG" "$BACKUP"
 echo "[信息] 已备份到 $BACKUP"
 
+TMP_CONFIG=$(mktemp)
+
 # 清除之前注入的规则（幂等，可重复执行）
-CLEAN=$(jq '
-  .route.rule_set = [.route.rule_set[] | select(
-    .tag | (startswith("whitelist-") or startswith("adblock-")) | not
-  )] |
-  .route.rules = [.route.rules[] | select(
-    if .rule_set then
-      (if (.rule_set | type) == "array"
-       then (.rule_set | any(startswith("whitelist-") or startswith("adblock-"))) | not
-       else ((.rule_set | startswith("whitelist-")) or (.rule_set | startswith("adblock-"))) | not
-       end)
-    else true end
-  )]
-' "$CONFIG")
-echo "$CLEAN" > "$CONFIG"
+# 关键修复：.route.rule_set / .route.rules 为空或不存在时，全部按 [] 处理，避免 jq Cannot iterate over null
+jq '
+  .route //= {} |
+
+  .route.rule_set = (
+    (.route.rule_set // []) |
+    map(select(
+      (((.tag // "") | startswith("whitelist-")) or ((.tag // "") | startswith("adblock-"))) | not
+    ))
+  ) |
+
+  .route.rules = (
+    (.route.rules // []) |
+    map(select(
+      if .rule_set then
+        if (.rule_set | type) == "array" then
+          (.rule_set | any(
+            (type == "string") and
+            (startswith("whitelist-") or startswith("adblock-"))
+          )) | not
+        elif (.rule_set | type) == "string" then
+          (((.rule_set // "") | startswith("whitelist-")) or ((.rule_set // "") | startswith("adblock-"))) | not
+        else
+          true
+        end
+      else
+        true
+      end
+    ))
+  )
+' "$CONFIG" > "$TMP_CONFIG"
+mv "$TMP_CONFIG" "$CONFIG"
+TMP_CONFIG=""
 
 # 构建白名单 rule_set 条目 JSON
 WL_RSETS_JSON="[]"
 for tag in "${VALID_WL[@]}"; do
-  WL_RSETS_JSON=$(echo "$WL_RSETS_JSON" | jq \
+  WL_RSETS_JSON=$(echo "$WL_RSETS_JSON" | jq -c \
     --arg tag "whitelist-${tag}" \
     --arg url "${URL_PREFIX}/${tag}.srs" \
-    '. + [{"type":"remote","tag":$tag,"url":$url,"download_detour":"01_direct_outbound"}]')
+    --arg detour "$DOWNLOAD_DETOUR" \
+    '. + [{"type":"remote","tag":$tag,"format":"binary","url":$url,"download_detour":$detour,"update_interval":"24h"}]')
 done
 
 WL_REFS_JSON="[]"
 for tag in "${VALID_WL[@]}"; do
-  WL_REFS_JSON=$(echo "$WL_REFS_JSON" | jq --arg t "whitelist-${tag}" '. + [$t]')
+  WL_REFS_JSON=$(echo "$WL_REFS_JSON" | jq -c --arg t "whitelist-${tag}" '. + [$t]')
 done
 
 # 构建广告屏蔽 rule_set 条目 JSON
 AD_RSETS_JSON="[]"
 for tag in "${VALID_AD[@]}"; do
-  AD_RSETS_JSON=$(echo "$AD_RSETS_JSON" | jq \
+  AD_RSETS_JSON=$(echo "$AD_RSETS_JSON" | jq -c \
     --arg tag "adblock-${tag}" \
     --arg url "${URL_PREFIX}/${tag}.srs" \
-    '. + [{"type":"remote","tag":$tag,"url":$url,"download_detour":"01_direct_outbound"}]')
+    --arg detour "$DOWNLOAD_DETOUR" \
+    '. + [{"type":"remote","tag":$tag,"format":"binary","url":$url,"download_detour":$detour,"update_interval":"24h"}]')
 done
 
 AD_REFS_JSON="[]"
 for tag in "${VALID_AD[@]}"; do
-  AD_REFS_JSON=$(echo "$AD_REFS_JSON" | jq --arg t "adblock-${tag}" '. + [$t]')
+  AD_REFS_JSON=$(echo "$AD_REFS_JSON" | jq -c --arg t "adblock-${tag}" '. + [$t]')
 done
 
-# 注入规则（顺序：白名单 → 广告屏蔽 → CN封锁）
+TMP_CONFIG=$(mktemp)
+
+# 注入规则（顺序：白名单 → 广告屏蔽 → CN 封锁）
+# 如果找不到 CN 封锁规则，默认插到第 1 条之后，尽量避开 sniff/dns 这类前置 action
 jq --argjson wl_rsets "$WL_RSETS_JSON" \
    --argjson wl_refs  "$WL_REFS_JSON"  \
    --argjson ad_rsets "$AD_RSETS_JSON" \
    --argjson ad_refs  "$AD_REFS_JSON"  \
    --arg     ad_out   "$AD_BLOCK_OUTBOUND" \
    '
+   .route //= {} |
+   .route.rule_set //= [] |
+   .route.rules //= [] |
+
    .route.rule_set += $wl_rsets + $ad_rsets |
 
    .route.rules as $rules |
@@ -202,11 +274,13 @@ jq --argjson wl_rsets "$WL_RSETS_JSON" \
 
    .route.rules = (
      $rules[:$idx] +
-     (if ($wl_refs | length) > 0  then [{"rule_set": $wl_refs, "outbound": "01_direct_outbound"}] else [] end) +
-     (if ($ad_refs | length) > 0  then [{"rule_set": $ad_refs, "outbound": $ad_out}]              else [] end) +
+     (if ($wl_refs | length) > 0 then [{"rule_set": $wl_refs, "outbound": "01_direct_outbound"}] else [] end) +
+     (if ($ad_refs | length) > 0 then [{"rule_set": $ad_refs, "outbound": $ad_out}] else [] end) +
      $rules[$idx:]
    )
-   ' "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
+   ' "$CONFIG" > "$TMP_CONFIG"
+mv "$TMP_CONFIG" "$CONFIG"
+TMP_CONFIG=""
 
 echo ""
 echo "[完成] 注入成功！"
@@ -214,11 +288,11 @@ echo "[完成] 注入成功！"
 [[ ${#VALID_AD[@]} -gt 0 ]] && echo "广告屏蔽:   ${VALID_AD[*]}"
 echo ""
 echo "当前路由规则顺序:"
-jq -r '.route.rules[] |
+jq -r '(.route.rules // [])[] |
   if .rule_set then
-    "  → rule_set: \(if (.rule_set|type)=="array" then (.rule_set|join(",")) else .rule_set end) → \(.outbound)"
+    "  → rule_set: \(if (.rule_set|type)=="array" then (.rule_set|join(",")) else .rule_set end) → \(.outbound // "-")"
   elif .domain_regex then
-    "  → domain_regex (\(.domain_regex|length) 条) → \(.outbound)"
+    "  → domain_regex (\(.domain_regex|length) 条) → \(.outbound // "-")"
   elif .action then
     "  → action: \(.action)"
   else
@@ -226,12 +300,13 @@ jq -r '.route.rules[] |
   end' "$CONFIG"
 echo ""
 
-# 校验配置（set -e 会导致命令替换失败时直接退出，需临时关闭）
+# 校验配置
 echo "[信息] 校验配置..."
 set +e
 CHECK_RESULT=$("$SINGBOX_BIN" check -c "$CONFIG" 2>&1)
 CHECK_STATUS=$?
 set -e
+
 if [[ $CHECK_STATUS -ne 0 ]]; then
   echo "[错误] 配置校验失败，回滚！"
   echo "$CHECK_RESULT"
@@ -243,7 +318,13 @@ echo "[信息] 配置校验通过"
 
 # 重启
 echo "[信息] 重启 sing-box..."
-systemctl restart sing-box
+if ! systemctl restart sing-box; then
+  echo "[错误] sing-box 重启失败，回滚！"
+  cp "$BACKUP" "$CONFIG"
+  systemctl restart sing-box || true
+  echo "[信息] 已回滚并尝试重启"
+  exit 1
+fi
 
 # 等待 sing-box 启动（最长 60 秒）
 echo "[信息] 等待 sing-box 启动..."
@@ -256,8 +337,12 @@ for i in $(seq 1 30); do
   fi
 done
 
-echo "[错误] sing-box 60秒内未启动，回滚！"
+echo "[错误] sing-box 60 秒内未启动，回滚！"
 cp "$BACKUP" "$CONFIG"
-systemctl restart sing-box
-echo "[信息] 已回滚并重启"
+systemctl restart sing-box || true
+echo "[信息] 已回滚并尝试重启"
 exit 1
+EOF
+
+chmod +x /usr/local/sbin/whitelist-inject.sh
+bash /usr/local/sbin/whitelist-inject.sh
