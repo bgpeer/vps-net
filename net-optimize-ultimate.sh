@@ -2381,12 +2381,13 @@ UPGRADEEOF
   cat > "$cron_file" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# Net-Optimize: monthly nginx install/upgrade, official nginx.org repo has Pin-Priority=1001
+CRON_TZ=Asia/Shanghai
+# Net-Optimize: monthly nginx install/upgrade at Beijing time, official nginx.org repo has Pin-Priority=1001
 0 3 1 * * root $nginx_upgrade_script
 EOF
 
   chmod 644 "$cron_file"
-  echo "✅ 已配置 Nginx 自动更新 cron：每月 1 号 03:00"
+  echo "✅ 已配置 Nginx 自动更新 cron：北京时间每月 1 号 03:00"
 
   # ---------- 7) 输出最终状态 ----------
   if have_cmd nginx; then
