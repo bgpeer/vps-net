@@ -10,7 +10,7 @@ SINGBOX_BIN="/etc/v2ray-agent/sing-box/sing-box"
 BACKUP="${CONFIG}.bak.$(date +%s)"
 
 WHITELIST_TAGS=(
-  "douyin"
+  "bytedance"
   "tiktok"
   "wildrift"
   "bilibili"
