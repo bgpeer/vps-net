@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🔍 Net-Optimize 状态检测脚本 v1.10（配合 v3.7.3）
-# 新增：CPU 调频 / XPS / 中断合并 / MPTCP / WireGuard 检测
+# 🔍 Net-Optimize 状态检测脚本 v1.11（配合 v3.8.0）
+# 新增：UDP GRO 转发 / LRO / conntrack hashsize / overcommit / MSS-路径MTU 匹配
 # ==============================================================================
 set -euo pipefail
 
@@ -71,7 +71,7 @@ detect_iface() {
 IPT_CMD="$(detect_ipt_backend)"
 OUT_IFACE="$(detect_iface)"
 
-echo "🔍 开始系统状态检测（Net-Optimize v3.7.3）..."
+echo "🔍 开始系统状态检测（Net-Optimize v3.8.0）..."
 title
 
 # === [1] 网络优化关键状态 ===
@@ -130,6 +130,8 @@ echo "  🔹 wmem_default = $(get net.core.wmem_default)"
   || echo "  🔹 rmem_max = $_rmem_max"
 echo "  🔹 wmem_max     = $(get net.core.wmem_max)"
 echo "  🔹 netdev_max_backlog = $(get net.core.netdev_max_backlog)"
+echo "✅ 内存提交策略（v3.8.0：ratio=100 防无 swap 小内存机大分配失败）："
+echo "  🔹 vm.overcommit_memory = $(get vm.overcommit_memory)  vm.overcommit_ratio = $(get vm.overcommit_ratio)"
 
 rp="$(get net.ipv4.conf.all.rp_filter)"
 case "$rp" in
@@ -155,6 +157,22 @@ if [[ -n "$OUT_IFACE" ]]; then
       [[ "$_val" == "on" ]] && _offloads+=" ✅$_s" || _offloads+=" ❌$_s"
     done
     echo "  Offload:$_offloads"
+
+    # LRO 应处于关闭状态（本机开启转发，LRO 包无法安全转发）
+    _lro="$(ethtool -k "$OUT_IFACE" 2>/dev/null | awk '/^large-receive-offload:/{print $2}' || true)"
+    if [[ "$_lro" == "on" ]]; then
+      yellow "  ⚠️ LRO: on（开启转发时应关闭，重跑主脚本可修正）"
+    else
+      echo "  🔹 LRO: ${_lro:-不支持}（off 为正常）"
+    fi
+
+    # UDP GRO 转发 + 发送分段卸载（v3.8.0 起通用开启，QUIC/UDP 代理加速）
+    _ugro="$(ethtool -k "$OUT_IFACE" 2>/dev/null | awk '/rx-udp-gro-forwarding:/{print $2}' || true)"
+    _useg="$(ethtool -k "$OUT_IFACE" 2>/dev/null | awk '/tx-udp-segmentation:/{print $2}' || true)"
+    [[ "$_ugro" == "on" ]] && green "  ✅ UDP GRO 转发: on（QUIC/Hysteria2/TUIC 加速）" \
+      || echo "  🔹 UDP GRO 转发: ${_ugro:-不支持}"
+    [[ "$_useg" == "on" ]] && green "  ✅ UDP 发送分段卸载: on" \
+      || echo "  🔹 UDP 发送分段卸载: ${_useg:-不支持}"
   fi
 
   _txql="$(ip link show "$OUT_IFACE" 2>/dev/null | grep -oP 'qlen \K\d+' || true)"
@@ -196,15 +214,16 @@ if [[ -n "$OUT_IFACE" ]]; then
     fi
   fi
 
-  # WireGuard
+  # WireGuard（出口网卡 UDP GRO 已在上方统一检测，这里看 WG 接口本身）
   if ip link show type wireguard >/dev/null 2>&1; then
     _wg_ifaces="$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | tr '\n' ' ' | xargs)"
     if [[ -n "$_wg_ifaces" ]]; then
       green "  ✅ WireGuard 接口: $_wg_ifaces"
-      _ugro="$(ethtool -k "$OUT_IFACE" 2>/dev/null | awk '/rx-udp-gro-forwarding:/{print $2}' || true)"
-      [[ "$_ugro" == "on" ]] \
-        && green "  ✅ UDP GRO 转发: on（WireGuard CPU 优化已生效）" \
-        || echo "  🔹 UDP GRO 转发: ${_ugro:-不支持}（rx-udp-gro-forwarding）"
+      _wg_first="${_wg_ifaces%% *}"
+      _wg_gro="$(ethtool -k "$_wg_first" 2>/dev/null | awk '/rx-udp-gro-forwarding:/{print $2}' || true)"
+      [[ "$_wg_gro" == "on" ]] \
+        && green "  ✅ WG 接口 UDP GRO 转发: on（$_wg_first）" \
+        || echo "  🔹 WG 接口 UDP GRO 转发: ${_wg_gro:-不支持}（$_wg_first）"
     else
       echo "  🔹 WireGuard: 内核模块已加载，但无活跃接口"
     fi
@@ -342,7 +361,7 @@ else
   if [[ "$_aggressive" -eq 1 ]]; then
     echo "  ℹ️ 游戏 QoS 未启用（激进模式下互斥）"
   else
-    echo "  ℹ️ 游戏 QoS 未启用（ENABLE_GAME_QOS=0 或未运行 v3.7.3+）"
+    echo "  ℹ️ 游戏 QoS 未启用（ENABLE_GAME_QOS=0 或未运行新版主脚本）"
   fi
 fi
 
@@ -383,6 +402,15 @@ if has_key net.netfilter.nf_conntrack_max || [[ -d /proc/sys/net/netfilter ]] ||
   echo "  🔸 udp_timeout            = $(get net.netfilter.nf_conntrack_udp_timeout)"
   echo "  🔸 udp_timeout_stream     = $(get net.netfilter.nf_conntrack_udp_timeout_stream)"
   echo "  🔸 tcp_timeout_established = $(get net.netfilter.nf_conntrack_tcp_timeout_established)"
+  # 哈希桶（v3.8.0：扩容到 max/4 减少高并发查表碰撞）
+  _ct_max="$(get net.netfilter.nf_conntrack_max)"
+  _ct_hash="$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo N/A)"
+  if [[ "$_ct_hash" != "N/A" && "$_ct_max" != "N/A" ]] && [[ "$_ct_hash" -ge $((_ct_max / 4)) ]] 2>/dev/null; then
+    green "  ✅ hashsize = $_ct_hash（≥ max/4，碰撞优化已生效）"
+  else
+    echo "  🔸 hashsize = $_ct_hash（建议 ≥ max/4，重跑主脚本可优化）"
+  fi
+  [[ -f /etc/modprobe.d/net-optimize-conntrack.conf ]] && green "  ✅ hashsize 持久化已配置（modprobe.d）"
 else
   yellow "ℹ️ nf_conntrack 未启用"
 fi
@@ -437,6 +465,30 @@ for _label_cmd in "IPv4:iptables:iptables-legacy:iptables-nft" "IPv6:ip6tables:i
   done
   [[ "$_found" -eq 0 ]] && echo "  ℹ️ $_label TCPMSS：未发现"
 done
+
+# 实测路径 MTU vs 配置 MSS（v3.8.0 起主脚本自动按路径 MTU 推导 MSS）
+if has ping; then
+  _pmtu=""
+  for _sz in 1472 1452 1424 1392; do
+    if ping -c1 -W1 -M do -s "$_sz" 1.1.1.1 >/dev/null 2>&1; then
+      _pmtu=$((_sz + 28)); break
+    fi
+  done
+  if [[ -n "$_pmtu" ]]; then
+    _ideal_mss=$((_pmtu - 40))
+    _rule_mss="$(grep -oP '^MSS_VALUE=\K\d+' /etc/net-optimize/config 2>/dev/null || true)"
+    echo "  🔸 实测路径 MTU = $_pmtu → 理想 MSS = $_ideal_mss"
+    if [[ -n "$_rule_mss" ]]; then
+      if [[ "$_rule_mss" -eq "$_ideal_mss" ]]; then
+        green "  ✅ 配置 MSS=$_rule_mss 与实际路径匹配"
+      else
+        yellow "  ⚠️ 配置 MSS=$_rule_mss ≠ 理想值 $_ideal_mss（重跑主脚本可自动校正）"
+      fi
+    fi
+  else
+    echo "  🔹 路径 MTU 探测失败（ICMP 不通），跳过 MSS 匹配检查"
+  fi
+fi
 
 [[ -f /etc/net-optimize/config ]] && { green "✅ 配置文件："; sed 's/^/    /' /etc/net-optimize/config; }
 
