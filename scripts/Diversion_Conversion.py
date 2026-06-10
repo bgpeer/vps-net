@@ -722,23 +722,36 @@ def main() -> None:
     valid_names = [ (it.get("name") or "").strip() for it in items if (it.get("name") or "").strip() ]
     cleanup_orphan_outputs(valid_names)
 
+    # 校验条目后【并行】拉取所有远程内容（manifest 全量，新增链接自动生效）
+    valid_items = []
     for it in items:
         name = (it.get("name") or "").strip()
         url = (it.get("url") or "").strip()
         fmt_in = (it.get("format") or "auto").strip().lower()
-
         if not name or not url:
             log(f"⚠️ Skip invalid item: {it}")
             continue
+        valid_items.append((name, url, fmt_in))
 
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fetch(entry):
+        try:
+            return http_get(entry[1])
+        except Exception as e:
+            return e
+
+    fetched = []
+    if valid_items:
+        with ThreadPoolExecutor(max_workers=min(8, len(valid_items))) as ex:
+            fetched = list(ex.map(_fetch, valid_items))
+
+    for (name, url, fmt_in), raw in zip(valid_items, fetched):
         log(f"\n==> {name}\n    url: {url}\n    format: {fmt_in}")
 
-        # 默认认为失败时要清理对应 name 的所有产物
-        try:
-            # 拉取远程内容
-            raw = http_get(url)
-        except Exception as e:
-            log(f"    ❌ HTTP 拉取失败: {e}")
+        # 拉取失败（已含重试）：严格模式下清理对应 name 的所有产物
+        if isinstance(raw, Exception):
+            log(f"    ❌ HTTP 拉取失败: {raw}")
             if STRICT_MODE:
                 log("    🧹 STRICT: HTTP 失败 -> 删除该 name 的所有产物")
                 cleanup_outputs_for_name(name)
