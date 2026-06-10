@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Generate SHA256SUMS
         run: sha256sum net-optimize-ultimate.sh > SHA256SUMS
@@ -28,4 +30,15 @@ jobs:
           git add SHA256SUMS
           git diff --cached --quiet && echo "SHA256SUMS unchanged" && exit 0
           git commit -m "chore: auto-update SHA256SUMS"
-          git push
+          # SHA256SUMS 过期会导致所有 VPS 的自动更新校验失败，push 必须带重试
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort || true; echo "Rebase failed."; exit 1; }
+            if git push origin HEAD:main; then
+              echo "Push success."; exit 0
+            fi
+            echo "Push rejected (race). retry=${i}"
+            sleep $((i*2))
+          done
+          echo "Failed to push after retries."
+          exit 1
