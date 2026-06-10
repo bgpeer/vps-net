@@ -6,10 +6,11 @@ on:
   schedule:
     - cron: "0 20 * * *"
   push:
+    branches: [main]
     paths:
       - remote-rules.json
       - scripts/Diversion_Conversion.py
-      - .github/workflows/buile-remote-mrs.yml
+      - .github/workflows/build-remote-mrs.yml
 
 permissions:
   contents: write
