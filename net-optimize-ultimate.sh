@@ -57,24 +57,43 @@ sha256_of() {
   fi
 }
 
+fetch_raw_to() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$2" "$1"
+  else
+    return 1
+  fi
+}
+
 # --- 自动更新（带 SHA256SUMS 签名校验）---
+# 注意：下载内容必须落盘后再算哈希。命令替换 $(...) 会剥掉末尾换行符，
+# 一旦仓库文件以换行结尾，哈希将永远对不上 SHA256SUMS，自动更新静默失效。
 auto_update() {
-  local remote_buf remote_hash local_hash
+  local tmp remote_hash local_hash
+  tmp="$(mktemp 2>/dev/null)" || return 0
 
-  remote_buf="$(fetch_raw "$REMOTE_URL" || true)"
-  [ -z "${remote_buf:-}" ] && return 0
+  if ! fetch_raw_to "$REMOTE_URL" "$tmp" || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
+    return 0
+  fi
 
-  remote_hash="$(printf "%s" "$remote_buf" | sha256_of)"
+  remote_hash="$(sha256sum "$tmp" 2>/dev/null | cut -d' ' -f1)"
   local_hash="$([ -f "$SCRIPT_PATH" ] && sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1 || echo "")"
 
   # 无变化：跳过
-  [ -n "$remote_hash" ] && [ "$remote_hash" = "$local_hash" ] && return 0
+  if [ -n "$remote_hash" ] && [ "$remote_hash" = "$local_hash" ]; then
+    rm -f "$tmp"
+    return 0
+  fi
 
   # SHA256SUMS 校验
   local sums_buf expected_hash
   sums_buf="$(fetch_raw "$REMOTE_SHA256SUMS_URL" || true)"
   if [ -z "${sums_buf:-}" ]; then
     echo "⚠️ 无法获取 SHA256SUMS，跳过自动更新（安全策略）"
+    rm -f "$tmp"
     return 0
   fi
 
@@ -82,6 +101,7 @@ auto_update() {
   expected_hash="$(printf "%s\n" "$sums_buf" | grep -E '(^|\s)net-optimize-ultimate\.sh$' | awk '{print $1}' | head -n1)"
   if [ -z "${expected_hash:-}" ]; then
     echo "⚠️ SHA256SUMS 中未找到脚本条目，跳过自动更新"
+    rm -f "$tmp"
     return 0
   fi
 
@@ -89,12 +109,13 @@ auto_update() {
     echo "❌ 远程脚本 SHA256 校验失败！可能被篡改，拒绝更新"
     echo "  期望: $expected_hash"
     echo "  实际: $remote_hash"
+    rm -f "$tmp"
     return 0
   fi
 
   echo "🌀 检测到新版本（SHA256 校验通过），正在更新..."
-  printf "%s" "$remote_buf" >"$SCRIPT_PATH"
-  chmod +x "$SCRIPT_PATH"
+  install -m755 "$tmp" "$SCRIPT_PATH"
+  rm -f "$tmp"
   exec "$SCRIPT_PATH" "$@"
 }
 
@@ -1354,16 +1375,20 @@ setup_game_qos() {
   # === 方案选择：优先 cake，fallback prio ===
   local qos_scheme="none"
 
-  # 检测 cake 是否可用，不可用时尝试安装内核模块
+  # 检测 cake 是否可用，不可用时尝试安装内核模块（尊重 SKIP_APT / 非 APT 系统）
   if ! modprobe sch_cake 2>/dev/null; then
-    echo "  ℹ️ sch_cake 模块未加载，尝试安装 linux-modules-extra..."
-    local kern
-    kern="$(uname -r)"
-    if apt-get install -y -qq "linux-modules-extra-${kern}" 2>/dev/null; then
-      echo "  ✅ linux-modules-extra-${kern} 安装成功，重新加载 sch_cake"
-      modprobe sch_cake 2>/dev/null || true
+    if [ "${SKIP_APT:-0}" != "1" ] && have_cmd apt-get; then
+      echo "  ℹ️ sch_cake 模块未加载，尝试安装 linux-modules-extra..."
+      local kern
+      kern="$(uname -r)"
+      if apt-get install -y -qq "linux-modules-extra-${kern}" 2>/dev/null; then
+        echo "  ✅ linux-modules-extra-${kern} 安装成功，重新加载 sch_cake"
+        modprobe sch_cake 2>/dev/null || true
+      else
+        echo "  ℹ️ linux-modules-extra-${kern} 不可用，跳过（将使用方案 B）"
+      fi
     else
-      echo "  ℹ️ linux-modules-extra-${kern} 不可用，跳过（将使用方案 B）"
+      echo "  ℹ️ sch_cake 模块未加载且跳过 APT 安装（将使用方案 B）"
     fi
   fi
 
@@ -1835,7 +1860,11 @@ SVCEOF
   echo "    → 阈值: $(( ADAPTIVE_QOS_THRESHOLD / 1024 )) KB/s"
   echo "    → 采样: 每 ${ADAPTIVE_QOS_INTERVAL}s"
   echo "    → 流量 ≥ 阈值 → pfifo_fast（抢带宽）"
-  echo "    → 流量 < 阈值 → ${has_cake:+cake}${has_cake:+/}prio（游戏低延迟）"
+  if [ "$has_cake" = "1" ]; then
+    echo "    → 流量 < 阈值 → cake/prio（游戏低延迟）"
+  else
+    echo "    → 流量 < 阈值 → prio（游戏低延迟）"
+  fi
   echo "    → 服务: systemctl status ${ADAPTIVE_QOS_SERVICE}"
 }
 

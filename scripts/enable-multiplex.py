@@ -75,7 +75,18 @@ with open(CONFIG, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 print("\n✅ 配置已写入")
 
-subprocess.run(["systemctl", "restart", "sing-box"], check=True)
+
+def rollback():
+    shutil.copy2(BAK, CONFIG)
+    print(f"↩️  已回滚到备份: {BAK}")
+    subprocess.run(["systemctl", "restart", "sing-box"])
+
+
+r = subprocess.run(["systemctl", "restart", "sing-box"])
+if r.returncode != 0:
+    print("❌ sing-box 重启失败，回滚配置")
+    rollback()
+    sys.exit(1)
 print("✅ sing-box 已重启，等待 2s...")
 time.sleep(2)
 
@@ -84,5 +95,6 @@ r = subprocess.run(["systemctl", "is-active", "sing-box"],
 if r.stdout.strip() == "active":
     print("✅ sing-box 运行正常")
 else:
-    print("❌ 启动失败，查日志：journalctl -u sing-box -n 50")
+    print("❌ 启动失败，回滚配置。日志：journalctl -u sing-box -n 50")
+    rollback()
     sys.exit(1)

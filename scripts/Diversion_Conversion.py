@@ -42,10 +42,21 @@ def safe_unlink(path: Path) -> None:
         log(f"    ⚠️ 删除失败: {path} -> {e}")
 
 
-def http_get(url: str) -> str:
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urlopen(req, timeout=60) as r:
-        return r.read().decode("utf-8", errors="ignore")
+def http_get(url: str, retries: int = 3) -> str:
+    """拉取 URL（失败重试 retries 次，指数退避）。
+    严格模式下拉取失败会删除已发布产物，重试可避免瞬时网络抖动误删。"""
+    import time
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=60) as r:
+                return r.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    raise last_exc
 
 
 def run(cmd, timeout: int = 180) -> str:
@@ -255,12 +266,21 @@ def parse_rule_lines_from_clash_like(raw_text: str) -> list:
 
 def strip_action(rule_line: str) -> str:
     """
-    把 "DOMAIN,example.com,PROXY" 裁成 "DOMAIN,example.com"
+    把 "DOMAIN,example.com,PROXY" 裁成 "DOMAIN,example.com"。
+    DOMAIN-REGEX 的值本身可含逗号（如量词 {2,6}），保留完整值，
+    仅剥离末尾的 no-resolve。
     """
-    parts = [p.strip() for p in (rule_line or "").split(",")]
-    if len(parts) >= 2:
-        return f"{parts[0]},{parts[1]}"
-    return (rule_line or "").strip()
+    line = (rule_line or "").strip()
+    if "," not in line:
+        return line
+    t, rest = line.split(",", 1)
+    t = t.strip()
+    rest = rest.strip()
+    if t.upper() == "DOMAIN-REGEX":
+        import re as _re
+        rest = _re.sub(r"\s*,\s*no-resolve\s*$", "", rest, flags=_re.IGNORECASE)
+        return f"{t},{rest}"
+    return f"{t},{rest.split(',', 1)[0].strip()}"
 
 
 def extract_supported_from_clash_lines(rule_lines: list) -> dict:
@@ -290,9 +310,10 @@ def extract_supported_from_clash_lines(rule_lines: list) -> dict:
         if t == "DOMAIN":
             b["domain"].add(v)
         elif t == "DOMAIN-SUFFIX":
-            # sing-box 这边习惯保留前导点
-            vv = v if v.startswith(".") else "." + v
-            b["domain_suffix"].add(vv)
+            # sing-box domain_suffix 用裸形式（不带前导点）：
+            # ".x" 只匹配子域名，裸 "x" 才同时匹配主域名 + 子域名，
+            # 与 Clash DOMAIN-SUFFIX 语义一致（已用 sing-box rule-set match 实测）
+            b["domain_suffix"].add(v.lstrip("."))
         elif t == "DOMAIN-KEYWORD":
             b["domain_keyword"].add(v)
         elif t == "DOMAIN-REGEX":
@@ -317,28 +338,45 @@ def extract_supported_from_clash_lines(rule_lines: list) -> dict:
 
 # ========= 纯列表解析（域名 / CIDR） =========
 
-def parse_domain_list(raw_text: str) -> list:
+def parse_domain_list(raw_text: str):
     """
-    解析 Loy 那种一行一个域名 / .域名 的 txt 列表，
-    也兼容 "DOMAIN,xxx" / "DOMAIN-SUFFIX,xxx" 这种写法。
+    解析 Loy 那种一行一个域名的列表，返回 (exact_domains, suffix_domains)。
+    兼容：
+      - Clash provider yaml 文本："  - '+.example.com'"（引号必须剥掉，
+        否则引号字符进入规则值，sing-box 侧永远匹配不到）
+      - "+.x" / ".x" → suffix；裸域名 → exact
+      - "DOMAIN,xxx" / "DOMAIN-SUFFIX,xxx" 写法
+    返回值均为裸域名（不带 +. / . 前缀），由调用方按目标格式加前缀。
     """
-    out = []
+    exact = set()
+    suffix = set()
     for line in (raw_text or "").splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
             continue
-        s = s.lstrip("-").strip()
+        s = s.lstrip("-").strip().strip("'\"")
         if not s:
             continue
 
         # 兼容 TYPE,VALUE 格式
         if looks_like_clash_rule_line(s):
             t, v = [x.strip() for x in strip_action(s).split(",", 1)]
+            v = v.strip("'\"")
             # 只吃 DOMAIN / DOMAIN-SUFFIX，其它（PROCESS-NAME 等）直接丢掉
-            if t.upper() in ("DOMAIN", "DOMAIN-SUFFIX"):
+            if t.upper() == "DOMAIN":
                 s = v
+            elif t.upper() == "DOMAIN-SUFFIX":
+                s = "+." + v.lstrip("+.")
             else:
                 continue
+
+        is_suffix = False
+        if s.startswith("+."):
+            is_suffix = True
+            s = s[2:]
+        elif s.startswith("."):
+            is_suffix = True
+            s = s.lstrip(".")
 
         # 必须像域名：至少有一个点
         if "." not in s:
@@ -350,9 +388,12 @@ def parse_domain_list(raw_text: str) -> list:
         if ":" in s:
             continue
 
-        out.append(s.lstrip("."))
+        if is_suffix:
+            suffix.add(s)
+        else:
+            exact.add(s)
 
-    return sorted(set(out))
+    return sorted(exact), sorted(suffix)
 
 
 def parse_cidr_list(raw_text: str):
@@ -748,20 +789,23 @@ def main() -> None:
 
         # ---- 2) 纯域名 txt ----
         if fmt == "domain-text":
-            domains = parse_domain_list(raw)
-            log(f"    ✅ parsed domain lines: {len(domains)}")
-            if not domains:
+            exact_domains, suffix_domains = parse_domain_list(raw)
+            total = len(exact_domains) + len(suffix_domains)
+            log(f"    ✅ parsed domain lines: {total} "
+                f"(exact={len(exact_domains)} suffix={len(suffix_domains)})")
+            if not total:
                 log("    ⚠️ domain-text parsed 0 -> 删除该 name 的所有产物（增删同步）")
                 cleanup_outputs_for_name(name)
                 continue
 
-            # mrs(domain)
-            build_mrs_domain_from_list(domains, name)
+            # mrs(domain)：精确域名原样，后缀域名加 +.（匹配主域名 + 子域名）
+            mrs_domains = sorted(set(exact_domains) | {"+." + d for d in suffix_domains})
+            build_mrs_domain_from_list(mrs_domains, name)
 
-            # srs：把这些全当 domain_suffix 来用（带前导点）
+            # srs：suffix 用裸形式（".x" 只匹配子域名，裸 "x" 才含主域名）
             b = {
-                "domain": set(),
-                "domain_suffix": {("." + d) for d in domains},
+                "domain": set(exact_domains),
+                "domain_suffix": set(suffix_domains),
                 "domain_keyword": set(),
                 "domain_regex": set(),
                 "ip_cidr": set(),
@@ -835,9 +879,9 @@ def main() -> None:
         for d in b["domain"]:
             domains_for_mrs.append(d.lstrip("."))
         for ds in b["domain_suffix"]:
-            # 保留/补充前导点，mihomo 用 .example.com 表示后缀匹配
-            vv = ds if ds.startswith(".") else "." + ds
-            domains_for_mrs.append(vv)
+            # b["domain_suffix"] 已是裸形式；mihomo 用 +.example.com 表示
+            # 主域名 + 子域名后缀匹配
+            domains_for_mrs.append("+." + ds.lstrip("+."))
 
         domains_for_mrs = sorted(set(domains_for_mrs))
         ip_for_mrs = sorted(set(list(b["ip_cidr"]) + list(b["ip_cidr6"])))

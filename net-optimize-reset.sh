@@ -72,9 +72,11 @@ rm -f /etc/sysctl.d/zzz-net-optimize-override.conf
 echo "  ✅ 已删除 sysctl 配置文件"
 
 # 恢复被禁用的冲突文件
+# 备份文件名格式: /etc/sysctl.d/foo.conf.disabled-by-net-optimize-<时间戳>
+# 去掉后缀即原文件名（原名已含 .conf，不能再追加 .conf）
 shopt -s nullglob
 for f in /etc/sysctl.d/*.disabled-by-net-optimize-*; do
-  orig="${f%.disabled-by-net-optimize-*}.conf"
+  orig="${f%.disabled-by-net-optimize-*}"
   # 如果原文件不存在才恢复，避免覆盖
   if [ ! -f "$orig" ]; then
     mv "$f" "$orig"
@@ -109,11 +111,14 @@ echo "🔧 [6] 清理 conntrack 配置..."
 rm -f /etc/modules-load.d/conntrack.conf
 echo "  ✅ 已删除 conntrack 模块开机加载配置"
 
-# === 7. 清理 NIC offload / RPS/RFS 持久化 ===
+# === 7. 清理 NIC offload / RPS/RFS / CPU 调频 / MPTCP 持久化 ===
 echo "🔧 [7] 清理网卡持久化配置..."
 rm -f /etc/udev/rules.d/99-net-optimize-offload.rules
 rm -f /etc/tmpfiles.d/net-optimize-rps.conf
-echo "  ✅ 已删除 offload/RPS/RFS 持久化规则"
+rm -f /etc/tmpfiles.d/net-optimize-cpufreq.conf
+rm -f /etc/sysctl.d/98-net-optimize-mptcp.conf
+rm -f /etc/networkd-dispatcher/routable.d/50-initcwnd
+echo "  ✅ 已删除 offload/RPS/RFS/cpufreq/MPTCP/initcwnd-hook 持久化规则"
 
 # === 8. 清理 initcwnd 路由参数 ===
 echo "🔧 [8] 清理 initcwnd 路由参数..."
@@ -145,7 +150,8 @@ fi
 # === 9. 清理 Nginx 自动更新 cron ===
 echo "🔧 [9] 清理 Nginx 自动更新 cron..."
 rm -f /etc/cron.d/net-optimize-nginx-update
-echo "  ✅ 已删除 Nginx 自动更新 cron"
+rm -f /usr/local/sbin/net-optimize-nginx-upgrade
+echo "  ✅ 已删除 Nginx 自动更新 cron 及升级脚本"
 
 # === 10. 删除配置目录和主脚本 ===
 echo "🔧 [10] 删除脚本和配置..."
