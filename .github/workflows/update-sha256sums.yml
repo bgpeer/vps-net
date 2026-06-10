@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'net-optimize-ultimate.sh'
+      - 'whitelist-inject.sh'
   workflow_dispatch: {}
 
 concurrency:
@@ -21,7 +22,7 @@ jobs:
           fetch-depth: 0
 
       - name: Generate SHA256SUMS
-        run: sha256sum net-optimize-ultimate.sh > SHA256SUMS
+        run: sha256sum net-optimize-ultimate.sh whitelist-inject.sh > SHA256SUMS
 
       - name: Commit & Push
         run: |

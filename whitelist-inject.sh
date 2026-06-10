@@ -1,5 +1,5 @@
 #!/bin/bash
-# whitelist-inject.sh v2.5
+# whitelist-inject.sh v2.6
 # v2ray-agent sing-box：在中国域名/IP 屏蔽规则前注入白名单放行规则，并屏蔽广告
 # 用法: bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelist-inject.sh)
 
@@ -28,8 +28,62 @@ URL_PREFIX="https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite"
 
 SCRIPT_INSTALL="/usr/local/sbin/whitelist-inject.sh"
 SCRIPT_URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelist-inject.sh"
+SHA256SUMS_URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/SHA256SUMS"
 CRON_FILE="/etc/cron.d/whitelist-inject"
 CRON_LOG="/var/log/whitelist-inject.log"
+
+# --- 自更新（带 SHA256SUMS 校验）---
+# cron 每天跑的是本地副本，仓库里改了 WHITELIST_TAGS 等名单后，
+# 必须先拉最新脚本再执行，否则名单永远停留在部署那一刻。
+# 注意：下载内容落盘后再算哈希（命令替换会剥末尾换行导致校验永远失败）。
+auto_update() {
+  command -v curl >/dev/null 2>&1 || return 0
+  command -v sha256sum >/dev/null 2>&1 || return 0
+
+  local tmp remote_hash local_hash sums expected
+  tmp="$(mktemp 2>/dev/null)" || return 0
+
+  if ! curl -fsSL --max-time 30 "$SCRIPT_URL" -o "$tmp" || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  remote_hash="$(sha256sum "$tmp" | cut -d' ' -f1)"
+  local_hash="$([ -f "$SCRIPT_INSTALL" ] && sha256sum "$SCRIPT_INSTALL" 2>/dev/null | cut -d' ' -f1 || echo "")"
+
+  # 已是最新：跳过
+  if [ -n "$remote_hash" ] && [ "$remote_hash" = "$local_hash" ]; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  sums="$(curl -fsSL --max-time 30 "$SHA256SUMS_URL" 2>/dev/null || true)"
+  expected="$(printf '%s\n' "$sums" | grep -E '(^|[[:space:]])whitelist-inject\.sh$' | awk '{print $1}' | head -n1)"
+  if [ -z "${expected:-}" ]; then
+    echo "[警告] SHA256SUMS 中未找到 whitelist-inject.sh 条目，跳过自更新"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  if [ "$remote_hash" != "$expected" ]; then
+    echo "[警告] 远程脚本 SHA256 校验失败，拒绝自更新（期望 $expected 实际 $remote_hash）"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  if ! bash -n "$tmp" 2>/dev/null; then
+    echo "[警告] 远程脚本语法检查失败，跳过自更新"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  echo "[信息] 检测到新版本脚本（SHA256 校验通过），更新并重新执行..."
+  install -m755 "$tmp" "$SCRIPT_INSTALL"
+  rm -f "$tmp"
+  exec "$SCRIPT_INSTALL" "$@"
+}
+
+auto_update "$@"
 
 TMP_CONFIG=""
 cleanup() {
