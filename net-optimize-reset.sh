@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 🧹 Net-Optimize 完整卸载/重置脚本
-# 配合 net-optimize-ultimate.sh v3.7.4 使用
+# 配合 net-optimize-ultimate.sh v3.8.0 使用
 # 清除所有优化配置，恢复系统默认状态
 # ==============================================================================
 set -euo pipefail
@@ -117,6 +117,7 @@ rm -f /etc/udev/rules.d/99-net-optimize-offload.rules
 rm -f /etc/tmpfiles.d/net-optimize-rps.conf
 rm -f /etc/tmpfiles.d/net-optimize-cpufreq.conf
 rm -f /etc/sysctl.d/98-net-optimize-mptcp.conf
+rm -f /etc/modprobe.d/net-optimize-conntrack.conf
 rm -f /etc/networkd-dispatcher/routable.d/50-initcwnd
 echo "  ✅ 已删除 offload/RPS/RFS/cpufreq/MPTCP/initcwnd-hook 持久化规则"
 
