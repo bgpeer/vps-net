@@ -855,10 +855,10 @@ setup_conntrack() {
   # conntrack 触发规则：INVALID -> DROP（与 apply 脚本保持一致）
   if command -v iptables >/dev/null 2>&1; then
     iptables -t filter -C INPUT  -m conntrack --ctstate INVALID -j DROP 2>/dev/null \
-      || iptables -t filter -I INPUT 1 -m conntrack --ctstate INVALID -j DROP
+      || iptables -t filter -I INPUT 1 -m conntrack --ctstate INVALID -j DROP || true
 
     iptables -t filter -C OUTPUT -m conntrack --ctstate INVALID -j DROP 2>/dev/null \
-      || iptables -t filter -I OUTPUT 1 -m conntrack --ctstate INVALID -j DROP
+      || iptables -t filter -I OUTPUT 1 -m conntrack --ctstate INVALID -j DROP || true
 
     echo "  ✅ 已写入 conntrack 触发规则（INVALID -> DROP）：INPUT/OUTPUT"
   fi
@@ -1813,7 +1813,7 @@ RestartSec=5
 WantedBy=multi-user.target
 SVCEOF
 
-  systemctl daemon-reload
+  systemctl daemon-reload || true
   systemctl enable "${ADAPTIVE_QOS_SERVICE}.service" 2>/dev/null || true
   systemctl restart "${ADAPTIVE_QOS_SERVICE}.service" 2>/dev/null || true
 
@@ -2290,7 +2290,7 @@ EOF
         echo "ℹ️ 已检测到 ondrej/nginx PPA 源，可用，共存保留"
       else
         find /etc/apt/sources.list.d -maxdepth 1 \
-          \( -name '*ondrej*nginx*' -o -name '*ondrej*' \) \
+          -name '*ondrej*nginx*' \
           -exec mv {} {}.disabled.$ts \; 2>/dev/null || true
         echo "ℹ️ ondrej/nginx PPA 已失效，已自动禁用，避免污染 apt update"
       fi
@@ -2989,7 +2989,7 @@ _ensure_swap() {
      && mkswap "$swap_file" >/dev/null 2>&1 \
      && swapon "$swap_file" 2>/dev/null; then
     echo "  ✅ 临时 swap 已启用"
-    trap 'swapoff "$swap_file" 2>/dev/null; rm -f "$swap_file"' EXIT
+    trap "swapoff '$swap_file' 2>/dev/null; rm -f '$swap_file'" EXIT
   else
     rm -f "$swap_file"
     echo "  ℹ️ swap 创建失败，继续运行"
