@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.7.4
+# 🚀 Net-Optimize-Ultimate v3.8.0
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
+# v3.8.0 新增：
+#   1) MSS 自动探测：按实际路径 MTU 推导（裸线路 1460 / WG 隧道防分片）
+#   2) UDP GRO 转发 + 发送分段卸载通用开启（QUIC/Hysteria2/TUIC 降 CPU）
+#   3) 出口网卡 LRO 强制关闭（开启转发时 LRO 包无法安全转发）
+#   4) conntrack 哈希桶扩容至 max/4（高并发中转降低查表碰撞）
+#   5) vm.overcommit_ratio=100（修复无 swap 小内存机 commit 上限仅半个 RAM）
 # v3.7.0 新增：
 #   1) BBRv2/BBRv3 自动检测（内核支持时优先启用）
 #   2) CPU 调频策略自动切换 performance（降低包处理延迟）
@@ -126,14 +132,16 @@ install -Dm755 "$0" "$SCRIPT_PATH" 2>/dev/null || true
 
 trap 'code=$?; echo "❌ 出错：第 ${BASH_LINENO[0]} 行 -> ${BASH_COMMAND} (退出码 $code)"; exit $code' ERR
 
-echo "🚀 Net-Optimize-Ultimate v3.7.4 开始执行..."
+echo "🚀 Net-Optimize-Ultimate v3.8.0 开始执行..."
 echo "========================================================"
 
 # === 2. 全局配置开关 ===
 : "${ENABLE_FQ_PIE:=1}"
 : "${ENABLE_MTU_PROBE:=1}"
 : "${ENABLE_MSS_CLAMP:=1}"
+MSS_USER_SET="${MSS_VALUE:+1}"  # 用户显式指定 MSS 时跳过自动探测
 : "${MSS_VALUE:=1452}"
+: "${MSS_AUTO:=1}"              # 自动探测路径 MTU 推导最优 MSS（探测失败回退默认值）
 : "${ENABLE_CONNTRACK_TUNE:=1}"
 : "${NFCT_MAX:=262144}"
 : "${ENABLE_NGINX_REPO:=1}"
@@ -664,7 +672,7 @@ write_sysctl_conf() {
 
   {
     echo "# ========================================================="
-    echo "# 🚀 Net-Optimize Ultimate v3.7.0 - Kernel Parameters"
+    echo "# 🚀 Net-Optimize Ultimate v3.8.0 - Kernel Parameters"
     echo "# Generated: $(date -u '+%F %T UTC')"
     echo "# ========================================================="
     echo
@@ -809,7 +817,8 @@ write_sysctl_conf() {
     echo "vm.mmap_min_addr = 65536"
     echo "vm.max_map_count = 1048576"
     echo "vm.swappiness = 1"
-    echo "vm.overcommit_memory = 2"  # 适度超量（commit_limit=swap+RAM*50%），避免 = 1 彻底关闭 OOM 保护导致内存耗尽
+    echo "vm.overcommit_memory = 2"  # 适度超量（commit_limit=swap+RAM*ratio%），避免 = 1 彻底关闭 OOM 保护导致内存耗尽
+    echo "vm.overcommit_ratio = 100"  # 默认 ratio=50 时无 swap 小内存机 commit 上限仅半个 RAM，大分配会直接失败
     echo "kernel.pid_max = 4194304"
     echo
     echo "fs.protected_fifos = 1"
@@ -873,6 +882,17 @@ setup_conntrack() {
 
   systemctl restart systemd-modules-load 2>/dev/null || true
 
+  # conntrack 哈希桶扩容：默认 buckets = max/8，高并发中转哈希链过长，
+  # 查表退化成线性扫描；提升到 max/4 减少碰撞（runtime + modprobe 持久化）
+  local nfct_hashsize=$((NFCT_MAX / 4))
+  if [ -w /sys/module/nf_conntrack/parameters/hashsize ]; then
+    echo "$nfct_hashsize" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null \
+      && echo "  ✅ conntrack hashsize=$nfct_hashsize（max/4，降低哈希碰撞）"
+  fi
+  install -d /etc/modprobe.d
+  echo "options nf_conntrack hashsize=$nfct_hashsize" > /etc/modprobe.d/net-optimize-conntrack.conf
+  chmod 644 /etc/modprobe.d/net-optimize-conntrack.conf
+
   # conntrack 触发规则：INVALID -> DROP（与 apply 脚本保持一致）
   if command -v iptables >/dev/null 2>&1; then
     iptables -t filter -C INPUT  -m conntrack --ctstate INVALID -j DROP 2>/dev/null \
@@ -916,6 +936,17 @@ setup_nic_offload() {
   # 开启 tx-nocache-copy 减少代理场景 CPU 拷贝
   ethtool -K "$iface" tx-nocache-copy on 2>/dev/null || true
 
+  # 关闭 LRO：本机开启了 ip_forward，LRO 合并后的包无法安全转发
+  # （内核会丢弃或重新分段，破坏中转性能；GRO 可转发，保留）
+  ethtool -K "$iface" lro off 2>/dev/null || true
+
+  # UDP GRO 转发 + 发送端分段：QUIC/Hysteria2/TUIC 等 UDP 代理收发
+  # 均可被内核批量聚合/分段，显著降低高 PPS 下的 CPU 占用（内核 5.4+/6.x）
+  ethtool -K "$iface" rx-udp-gro-forwarding on 2>/dev/null \
+    && echo "  ✅ UDP GRO 转发已开启（QUIC/UDP 代理加速）" \
+    || echo "  ℹ️ UDP GRO 转发：网卡不支持或内核版本不足，已跳过"
+  ethtool -K "$iface" tx-udp-segmentation on 2>/dev/null || true
+
   # 激进模式：加大网卡环形缓冲区
   if [ "${AGGRESSIVE_MODE:-0}" = "1" ]; then
     # 加大 txqueuelen（发送队列深度）
@@ -943,7 +974,9 @@ setup_nic_offload() {
   local udev_file="/etc/udev/rules.d/99-net-optimize-offload.rules"
   {
     echo "# Net-Optimize: NIC offload 持久化"
-    echo "ACTION==\"add\", SUBSYSTEM==\"net\", NAME==\"$iface\", RUN+=\"/usr/sbin/ethtool -K $iface gro on gso on tso on sg on tx-nocache-copy on\""
+    echo "ACTION==\"add\", SUBSYSTEM==\"net\", NAME==\"$iface\", RUN+=\"/usr/sbin/ethtool -K $iface gro on gso on tso on sg on tx-nocache-copy on lro off\""
+    # UDP GRO / 分段卸载网卡可能不支持，单独一条并容错，避免拖垮上一条
+    echo "ACTION==\"add\", SUBSYSTEM==\"net\", NAME==\"$iface\", RUN+=\"/bin/sh -c '/usr/sbin/ethtool -K $iface rx-udp-gro-forwarding on tx-udp-segmentation on 2>/dev/null || true'\""
     if [ "${AGGRESSIVE_MODE:-0}" = "1" ]; then
       echo "ACTION==\"add\", SUBSYSTEM==\"net\", NAME==\"$iface\", RUN+=\"/usr/sbin/ip link set $iface txqueuelen 10000\""
     fi
@@ -964,20 +997,17 @@ setup_nic_offload() {
   fi
 
   # === WireGuard UDP GRO 转发（降低 WG 中转 CPU 占用）===
+  # 出口网卡的 rx-udp-gro-forwarding 已在上面统一开启，这里只处理 WG 接口
   if [ "${ENABLE_WG_OPT:-1}" = "1" ]; then
     if ip link show type wireguard >/dev/null 2>&1; then
-      # 开启出口网卡的 UDP GRO 转发，让内核合并 WG UDP 包再转发
-      ethtool -K "$iface" rx-udp-gro-forwarding on 2>/dev/null \
-        && echo "  ✅ WireGuard UDP GRO 转发已开启（$iface）" \
-        || echo "  ℹ️ WireGuard UDP GRO 转发：网卡不支持或内核版本不足，已跳过"
-      # 对每个 WG 接口也开启 rx-udp-gro-forwarding
       local wg_iface
       while IFS= read -r wg_iface; do
         [ -z "$wg_iface" ] && continue
         ethtool -K "$wg_iface" rx-udp-gro-forwarding on 2>/dev/null || true
       done < <(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}')
+      echo "  ✅ WireGuard 接口 UDP GRO 转发已开启"
     else
-      echo "  ℹ️ 未检测到 WireGuard 接口，跳过 UDP GRO 转发"
+      echo "  ℹ️ 未检测到 WireGuard 接口，跳过 WG 接口 GRO"
     fi
   fi
 }
@@ -1947,6 +1977,21 @@ _strip_route_params() {
      s/ pref [a-z]+//g'
 }
 
+# --- 路径 MTU 探测：DF 置位 ping 从大到小试探，返回实际路径 MTU ---
+# payload 1472→MTU 1500（裸线路）、1452→1480（PPPoE）、1424→1452、1392→1420（WG/隧道常见）
+_probe_path_mtu() {
+  local size target
+  for size in 1472 1452 1424 1392; do
+    for target in 1.1.1.1 8.8.8.8; do
+      if ping -c1 -W2 -M do -s "$size" "$target" >/dev/null 2>&1; then
+        echo $((size + 28))
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
 # --- 检测 iptables 实际可用后端 ---
 # 有些系统同时装了 iptables-nft 和 iptables-legacy，默认 iptables 指向 nft，
 # 但 legacy tables 存在时 nft 后端写入会静默失败或被忽略。
@@ -2044,6 +2089,19 @@ setup_mss_clamping() {
   # 确保 netfilter-persistent 处于启用状态（可能被旧版脚本禁用过）
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files netfilter-persistent.service >/dev/null 2>&1; then
     systemctl enable netfilter-persistent 2>/dev/null || true
+  fi
+
+  # MSS 自动探测：固定 1452 在裸 1500 线路上浪费 8 字节/包，在 WG/隧道
+  # 线路（路径 MTU 1420）上反而过大导致分片。按实际路径 MTU 推导（MTU-40），
+  # 用户显式指定 MSS_VALUE 或探测失败时保持原值
+  if [ "${MSS_AUTO:-1}" = "1" ] && [ -z "${MSS_USER_SET:-}" ] && have_cmd ping; then
+    local _probed_mtu
+    if _probed_mtu="$(_probe_path_mtu)"; then
+      MSS_VALUE=$((_probed_mtu - 40))
+      echo "✅ 路径 MTU 探测: ${_probed_mtu} → MSS=$MSS_VALUE"
+    else
+      echo "ℹ️ 路径 MTU 探测失败（ICMP 不通），使用默认 MSS=$MSS_VALUE"
+    fi
   fi
 
   echo "📡 设置MSS Clamping (MSS=$MSS_VALUE)..."
@@ -2778,7 +2836,7 @@ _final_ef="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c
 _final_af41="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -cE '0x22|dscp-class AF41|set-dscp 34' || true)"
 logger -t net-optimize "BOOT: 最终 TCPMSS=$_final_tcpmss EF=$_final_ef AF41=$_final_af41"
 
-echo "[$(date)] Net-Optimize v3.7.0 开机优化完成"
+echo "[$(date)] Net-Optimize v3.8.0 开机优化完成"
 APPLYEOF
 
   chmod +x "$APPLY_SCRIPT"
@@ -3029,7 +3087,7 @@ main() {
   require_root
   _ensure_swap
 
-  echo "🚀 Net-Optimize-Ultimate v3.7.1 启动..."
+  echo "🚀 Net-Optimize-Ultimate v3.8.0 启动..."
   echo "========================================================"
 
   clean_old_config
