@@ -18,6 +18,7 @@ WHITELIST_TAGS=(
   "alibaba"
   "tencent"
   "kuaishou"
+  "geolocation-!cn"
 )
 
 AD_BLOCK_TAGS=(
