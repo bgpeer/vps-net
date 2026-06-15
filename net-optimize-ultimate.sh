@@ -690,8 +690,8 @@ write_sysctl_conf() {
     echo
 
     echo "# === 网卡收包预算 ==="
-    echo "net.core.netdev_budget = 50000"
-    echo "net.core.netdev_budget_usecs = 5000"
+    echo "net.core.netdev_budget = 600"
+    echo "net.core.netdev_budget_usecs = 3000"
     echo
 
     echo "# === 连接生命周期 ==="
@@ -716,14 +716,14 @@ write_sysctl_conf() {
     echo "net.ipv4.tcp_timestamps = 1"
     echo "net.ipv4.tcp_autocorking = 0"
     echo "net.ipv4.tcp_orphan_retries = 1"
-    echo "net.ipv4.tcp_retries2 = 5"
+    echo "net.ipv4.tcp_retries2 = 15"
     echo "net.ipv4.tcp_synack_retries = 1"
     echo "net.ipv4.tcp_early_retrans = 3"
     echo "net.ipv4.tcp_thin_linear_timeouts = 1"  # 游戏/交互小包流：线性重传替代指数退避
     echo
     echo "# === 低延迟轮询（代理/游戏服务器降低响应延迟）==="
-    echo "net.core.busy_poll = 50"    # socket poll 忙等 50μs，减少中断唤醒延迟
-    echo "net.core.busy_read = 50"    # socket read 忙等 50μs
+    echo "net.core.busy_poll = 0"    # socket poll 忙等 0μs，减少中断唤醒延迟
+    echo "net.core.busy_read = 0"    # socket read 忙等 0μs
     echo
     # 注：tcp_low_latency 在 4.14+ 已移除；tcp_fack / tcp_frto 在 BBR 下无实际作用
     # 不再写入，避免 sysctl -e 报 unknown key 警告
