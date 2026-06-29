@@ -119,3 +119,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelis
 **✅ 适配Android sing-box 内核 1.12.12以上**
 
 [👉 一键查看模板](https://cdn.gh-proxy.org/https://gist.github.com/bgpeer/ea81e07938efe1b2e892db7a9bee872e/raw/singbox-config.json)
+
+---
+
+**如果需要更多的分流配置规则请到旁边仓库观看**
+https://github.com/bgpeer/rules
