@@ -122,3 +122,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelis
 
 **如果需要更多的分流配置规则请到旁边仓库观看**
 https://github.com/bgpeer/rules
+
+---
+
+## ⚠️ 风险提示与免责声明
+
+- 本仓库脚本会**修改系统内核参数、网络配置、软件源与内核**(如 BBR/BBRPlus、sysctl、ulimit 等),属于高风险操作。请在**可随时重装、无重要数据**的机器上使用;操作前务必**备份重要资料**。
+- 脚本按「**现状(AS IS)**」提供,不作任何明示或暗示的担保。因使用本仓库脚本导致的系统异常、死机、数据丢失、服务中断或任何直接/间接损失,**由使用者自行承担**,作者不承担任何责任。
+- 部分功能依赖或引用了**第三方脚本/项目**(例如 BBRPlus 内核安装来自 [ylx2016/Linux-NetSpeed](https://github.com/ylx2016/Linux-NetSpeed)),其版权与责任归各自作者所有,请遵循对应项目的许可协议。
+- 请在遵守你所在地区**法律法规**及 VPS 服务商**服务条款**的前提下使用;网络代理/优化相关内容仅供学习与个人自用。
+
+## 📄 License
+
+本项目以 [MIT License](./LICENSE) 开源;第三方组件版权归其各自作者所有。
