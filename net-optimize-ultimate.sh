@@ -721,9 +721,9 @@ write_sysctl_conf() {
     echo "net.ipv4.tcp_early_retrans = 3"
     echo "net.ipv4.tcp_thin_linear_timeouts = 1"  # 游戏/交互小包流：线性重传替代指数退避
     echo
-    echo "# === 低延迟轮询（代理/游戏服务器降低响应延迟）==="
-    echo "net.core.busy_poll = 0"    # socket poll 忙等 0μs，减少中断唤醒延迟
-    echo "net.core.busy_read = 0"    # socket read 忙等 0μs
+    echo "# === 低延迟轮询（默认关闭：全局忙等在小核数 VPS 上纯烧 CPU）==="
+    echo "net.core.busy_poll = 0"    # 0=关闭；专用大核机器可自行改 50 启用忙等轮询
+    echo "net.core.busy_read = 0"    # 0=关闭
     echo
     # 注：tcp_low_latency 在 4.14+ 已移除；tcp_fack / tcp_frto 在 BBR 下无实际作用
     # 不再写入，避免 sysctl -e 报 unknown key 警告
