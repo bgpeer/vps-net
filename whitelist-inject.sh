@@ -1,5 +1,5 @@
 #!/bin/bash
-# whitelist-inject.sh v2.7
+# whitelist-inject.sh v2.7.1
 # v2ray-agent(mack-a) sing-box：注入广告屏蔽 + 白名单放行规则
 # 规则顺序：广告屏蔽 → 白名单放行 → CN 屏蔽（广告优先，白名单内服务的广告同样被拦截）
 #
@@ -45,6 +45,7 @@ SCRIPT_URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelist-inje
 SHA256SUMS_URL="https://raw.githubusercontent.com/bgpeer/vps-net/main/SHA256SUMS"
 CRON_FILE="/etc/cron.d/whitelist-inject"
 CRON_LOG="/var/log/whitelist-inject.log"
+LOGROTATE_FILE="/etc/logrotate.d/whitelist-inject"
 
 # --- 自更新（带 SHA256SUMS 校验）---
 # cron 每天跑的是本地副本，仓库里改了 WHITELIST_TAGS 等名单后，
@@ -145,6 +146,20 @@ CRON_TZ=UTC
 CRON_EOF
 
   chmod 644 "$CRON_FILE"
+
+  # 日志轮转：每月一次或超过 1MB 时轮转，保留 3 份压缩归档，防止无限增长
+  cat > "$LOGROTATE_FILE" <<'LOGR_EOF'
+/var/log/whitelist-inject.log {
+    monthly
+    maxsize 1M
+    rotate 3
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+LOGR_EOF
+  chmod 644 "$LOGROTATE_FILE"
 
   echo "[定时] ✓ 定时任务已安装"
   echo "       时间: 每天北京时间 03:00（UTC 19:00）"
@@ -522,6 +537,9 @@ do_remove() {
   rm -f "$CRON_FILE"
   log "已删除定时任务: $CRON_FILE"
 
+  rm -f "$LOGROTATE_FILE"
+  log "已删除日志轮转配置: $LOGROTATE_FILE"
+
   # 最后删除本地脚本（正在执行的副本删除后不再读取新内容，安全）
   rm -f "$SCRIPT_INSTALL"
   log "已删除本地脚本: $SCRIPT_INSTALL"
@@ -540,7 +558,7 @@ case "$ACTION" in
   "")
     if [ -t 0 ]; then
       echo ""
-      echo "========= whitelist-inject v2.7 ========="
+      echo "========= whitelist-inject v2.7.1 ========="
       echo "  1. 安装（注入规则 + 每日自动刷新）"
       echo "  2. 更新（拉最新脚本与规则集后重新注入）"
       echo "  0. 删除（移除注入规则、定时任务与本地脚本）"
