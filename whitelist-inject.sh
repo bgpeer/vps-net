@@ -1,7 +1,20 @@
 #!/bin/bash
-# whitelist-inject.sh v2.6
-# v2ray-agent sing-box：在中国域名/IP 屏蔽规则前注入白名单放行规则，并屏蔽广告
-# 用法: bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelist-inject.sh)
+# whitelist-inject.sh v2.7
+# v2ray-agent(mack-a) sing-box：注入广告屏蔽 + 白名单放行规则
+# 规则顺序：广告屏蔽 → 白名单放行 → CN 屏蔽（广告优先，白名单内服务的广告同样被拦截）
+#
+# 与 mack-a 脚本共存：本脚本安装在 /usr/local/sbin、定时任务在 /etc/cron.d，
+# 均在 /etc/v2ray-agent 目录之外——mack-a 更新/重装不会删除本脚本；
+# 若 mack-a 重写了 config.json 冲掉注入规则，每日 03:00 的 cron 会自动重新注入。
+#
+# 用法:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/whitelist-inject.sh)
+#     交互执行弹出菜单：1=安装  2=更新  0=删除
+#   也可直接带参数（脚本/cron 调用）：
+#     ... whitelist-inject.sh 1|install   安装（注入规则 + 配置每日自动刷新）
+#     ... whitelist-inject.sh 2|update    更新（拉最新脚本与规则集后重新注入）
+#     ... whitelist-inject.sh 0|remove    删除（移除注入规则、定时任务与本地脚本）
+#   非交互且无参数（如 cron / 管道）默认执行「更新」。
 
 set -Eeuo pipefail
 
@@ -128,7 +141,7 @@ setup_auto_refresh() {
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 CRON_TZ=UTC
-0 19 * * * root $SCRIPT_INSTALL >> $CRON_LOG 2>&1
+0 19 * * * root $SCRIPT_INSTALL update >> $CRON_LOG 2>&1
 CRON_EOF
 
   chmod 644 "$CRON_FILE"
@@ -210,267 +223,360 @@ precheck_tags() {
   echo "${valid[*]}"
 }
 
-if [[ ! -f "$CONFIG" ]]; then
-  err "配置文件不存在: $CONFIG"
-  exit 1
-fi
-
-if [[ ! -x "$SINGBOX_BIN" ]]; then
-  err "sing-box 二进制不存在: $SINGBOX_BIN"
-  exit 1
-fi
-
-if ! command -v jq &>/dev/null; then
-  log "安装 jq..."
-  apt-get update -qq && apt-get install -y -qq jq
-fi
-
-if ! jq empty "$CONFIG" >/dev/null 2>&1; then
-  err "当前配置不是合法 JSON: $CONFIG"
-  exit 1
-fi
-
-VALID_WL_STR="$(precheck_tags "白名单" "${WHITELIST_TAGS[@]}")"
-VALID_WL=($VALID_WL_STR)
-echo ""
-
-VALID_AD_STR="$(precheck_tags "广告屏蔽" "${AD_BLOCK_TAGS[@]}")"
-VALID_AD=($VALID_AD_STR)
-echo ""
-
-if [[ ${#VALID_WL[@]} -eq 0 && ${#VALID_AD[@]} -eq 0 ]]; then
-  err "所有规则集均不可用，退出"
-  exit 1
-fi
-
-cp "$CONFIG" "$BACKUP"
-log "已备份到 $BACKUP"
-
-DIRECT_OUTBOUND="$(detect_outbound_by_type "direct" "01_direct_outbound" "direct" "direct_outbound" "DIRECT" "🇨🇳直连" "🎯直连")"
-
-if [[ -z "$DIRECT_OUTBOUND" ]]; then
-  DIRECT_OUTBOUND="direct_outbound"
-  ensure_outbound_exists "$DIRECT_OUTBOUND" "direct"
-  warn "未检测到 direct 出站，已自动添加: $DIRECT_OUTBOUND"
-else
-  log "检测到直连出站: $DIRECT_OUTBOUND"
-fi
-
-BLOCK_OUTBOUND="$(detect_outbound_by_type "block" "block_ip_outbound" "block" "block_outbound" "reject")"
-
-if [[ ${#VALID_AD[@]} -gt 0 ]]; then
-  if [[ -z "$BLOCK_OUTBOUND" ]]; then
-    BLOCK_OUTBOUND="block_ip_outbound"
-    ensure_outbound_exists "$BLOCK_OUTBOUND" "block"
-    warn "未检测到 block 出站，已自动添加: $BLOCK_OUTBOUND"
-  else
-    log "检测到拦截出站: $BLOCK_OUTBOUND"
+require_env() {
+  if [[ ! -f "$CONFIG" ]]; then
+    err "配置文件不存在: $CONFIG"
+    exit 1
   fi
-fi
 
-TMP_CONFIG="$(mktemp)"
+  if [[ ! -x "$SINGBOX_BIN" ]]; then
+    err "sing-box 二进制不存在: $SINGBOX_BIN"
+    exit 1
+  fi
 
-jq '
-  .route //= {} |
+  if ! command -v jq &>/dev/null; then
+    log "安装 jq..."
+    apt-get update -qq && apt-get install -y -qq jq
+  fi
 
-  .route.rule_set = (
-    (.route.rule_set // []) |
-    map(select(
-      (((.tag // "") | startswith("whitelist-")) or ((.tag // "") | startswith("adblock-"))) | not
-    ))
-  ) |
+  if ! jq empty "$CONFIG" >/dev/null 2>&1; then
+    err "当前配置不是合法 JSON: $CONFIG"
+    exit 1
+  fi
+}
 
-  .route.rules = (
-    (.route.rules // []) |
-    map(select(
-      if .rule_set then
-        if (.rule_set | type) == "array" then
-          (.rule_set | any(
-            (type == "string") and
-            (startswith("whitelist-") or startswith("adblock-"))
-          )) | not
-        elif (.rule_set | type) == "string" then
-          (((.rule_set // "") | startswith("whitelist-")) or ((.rule_set // "") | startswith("adblock-"))) | not
+# 移除本脚本注入的 whitelist-/adblock- rule_set 定义与引用
+strip_injected() {
+  TMP_CONFIG="$(mktemp)"
+
+  jq '
+    .route //= {} |
+
+    .route.rule_set = (
+      (.route.rule_set // []) |
+      map(select(
+        (((.tag // "") | startswith("whitelist-")) or ((.tag // "") | startswith("adblock-"))) | not
+      ))
+    ) |
+
+    .route.rules = (
+      (.route.rules // []) |
+      map(select(
+        if .rule_set then
+          if (.rule_set | type) == "array" then
+            (.rule_set | any(
+              (type == "string") and
+              (startswith("whitelist-") or startswith("adblock-"))
+            )) | not
+          elif (.rule_set | type) == "string" then
+            (((.rule_set // "") | startswith("whitelist-")) or ((.rule_set // "") | startswith("adblock-"))) | not
+          else
+            true
+          end
         else
           true
         end
-      else
-        true
-      end
-    ))
-  )
-' "$CONFIG" > "$TMP_CONFIG"
+      ))
+    )
+  ' "$CONFIG" > "$TMP_CONFIG"
 
-mv "$TMP_CONFIG" "$CONFIG"
-TMP_CONFIG=""
+  mv "$TMP_CONFIG" "$CONFIG"
+  TMP_CONFIG=""
+}
 
-WL_RSETS_JSON="[]"
-for tag in "${VALID_WL[@]}"; do
-  WL_RSETS_JSON="$(printf '%s' "$WL_RSETS_JSON" | jq -c \
-    --arg tag "whitelist-${tag}" \
-    --arg url "${URL_PREFIX}/${tag}.srs" \
-    --arg detour "$DIRECT_OUTBOUND" \
-    '. + [{"type":"remote","tag":$tag,"format":"binary","url":$url,"download_detour":$detour,"update_interval":"24h"}]')"
-done
+# 校验配置并重启 sing-box；任何一步失败都回滚备份。
+# 配置与备份完全一致时跳过重启（避免每日 cron 无谓中断连接）。
+validate_and_restart() {
+  if cmp -s "$CONFIG" "$BACKUP"; then
+    log "配置无变化，跳过校验与重启"
+    return 0
+  fi
 
-WL_REFS_JSON="[]"
-for tag in "${VALID_WL[@]}"; do
-  WL_REFS_JSON="$(printf '%s' "$WL_REFS_JSON" | jq -c --arg t "whitelist-${tag}" '. + [$t]')"
-done
+  echo "[信息] 校验配置..."
+  set +e
+  CHECK_RESULT="$("$SINGBOX_BIN" check -c "$CONFIG" 2>&1)"
+  CHECK_STATUS=$?
+  set -e
 
-AD_RSETS_JSON="[]"
-for tag in "${VALID_AD[@]}"; do
-  AD_RSETS_JSON="$(printf '%s' "$AD_RSETS_JSON" | jq -c \
-    --arg tag "adblock-${tag}" \
-    --arg url "${URL_PREFIX}/${tag}.srs" \
-    --arg detour "$DIRECT_OUTBOUND" \
-    '. + [{"type":"remote","tag":$tag,"format":"binary","url":$url,"download_detour":$detour,"update_interval":"24h"}]')"
-done
+  if [[ $CHECK_STATUS -ne 0 ]]; then
+    err "配置校验失败，回滚！"
+    echo "$CHECK_RESULT"
+    cp "$BACKUP" "$CONFIG"
+    log "已回滚到备份"
+    exit 1
+  fi
 
-AD_REFS_JSON="[]"
-for tag in "${VALID_AD[@]}"; do
-  AD_REFS_JSON="$(printf '%s' "$AD_REFS_JSON" | jq -c --arg t "adblock-${tag}" '. + [$t]')"
-done
+  log "配置校验通过"
 
-TMP_CONFIG="$(mktemp)"
+  echo "[信息] 重启 sing-box..."
+  if ! systemctl restart sing-box; then
+    err "sing-box 重启失败，回滚！"
+    cp "$BACKUP" "$CONFIG"
+    systemctl restart sing-box || true
+    log "已回滚并尝试重启"
+    exit 1
+  fi
 
-# 注入并整理 route.rules 顺序：
-# [0] sniff
-# [1] 原有放行/其它前置规则，例如 Apple 放行
-# [2] 白名单放行
-# [3] 广告屏蔽
-# [4] 中国域名屏蔽
-# [5] 中国 IP 屏蔽
-# [6] 原本在 CN 屏蔽后面的其它规则，保持在后面
-jq --argjson wl_rsets "$WL_RSETS_JSON" \
-   --argjson wl_refs  "$WL_REFS_JSON"  \
-   --argjson ad_rsets "$AD_RSETS_JSON" \
-   --argjson ad_refs  "$AD_REFS_JSON"  \
-   --arg     direct_out "$DIRECT_OUTBOUND" \
-   --arg     block_out  "$BLOCK_OUTBOUND" \
-   '
-   def arr(x): if (x|type)=="array" then x else [x] end;
-   def refs: if .rule_set? then arr(.rule_set) else [] end;
+  echo "[信息] 等待 sing-box 启动..."
+  local i
+  for i in $(seq 1 30); do
+    sleep 2
+    if systemctl is-active --quiet sing-box; then
+      echo "[完成] sing-box 运行中 ✓（等待了 $((i*2)) 秒）"
+      return 0
+    fi
+  done
 
-   def is_sniff:
-     .action? == "sniff";
-
-   def is_cn_domain_block:
-     (.rule_set? != null) and
-     (refs | any(
-       . == "cn_cn_block_route" or
-       test("(^|[-_])geosite[-_]?cn($|[-_])"; "i") or
-       test("^cn[_-]cn[_-]block[_-]route$"; "i") or
-       test("(^|[-_])cn[-_]?block[-_]?route$"; "i")
-     ));
-
-   def is_cn_ip_block:
-     (.rule_set? != null) and
-     (refs | any(
-       . == "geoip_cn_cn_block_ip_route" or
-       test("(^|[-_])geoip[-_]?cn($|[-_])"; "i") or
-       test("cn[-_]?block[-_]?ip"; "i")
-     ));
-
-   .route //= {} |
-   .route.rule_set //= [] |
-   .route.rules //= [] |
-
-   .route.rule_set += $wl_rsets + $ad_rsets |
-
-   .route.rules as $rules |
-
-   (
-     $rules
-     | to_entries
-     | map(select(.value | (is_cn_domain_block or is_cn_ip_block)))
-     | .[0].key // ($rules | length)
-   ) as $cn_idx |
-
-   ($rules | map(select(is_sniff))) as $sniff_rules |
-   ($rules | map(select(is_cn_domain_block))) as $cn_domain_rules |
-   ($rules | map(select(is_cn_ip_block))) as $cn_ip_rules |
-
-   ($rules[:$cn_idx] | map(select((is_sniff or is_cn_domain_block or is_cn_ip_block) | not))) as $before_cn |
-   ($rules[$cn_idx:] | map(select((is_sniff or is_cn_domain_block or is_cn_ip_block) | not))) as $after_cn |
-
-   .route.rules = (
-     $sniff_rules +
-     $before_cn +
-     (if ($wl_refs | length) > 0 then [{"rule_set": $wl_refs, "outbound": $direct_out}] else [] end) +
-     (if ($ad_refs | length) > 0 then [{"rule_set": $ad_refs, "outbound": $block_out}] else [] end) +
-     $cn_domain_rules +
-     $cn_ip_rules +
-     $after_cn
-   )
-   ' "$CONFIG" > "$TMP_CONFIG"
-
-mv "$TMP_CONFIG" "$CONFIG"
-TMP_CONFIG=""
-
-echo ""
-echo "[完成] 注入成功！"
-[[ ${#VALID_WL[@]} -gt 0 ]] && echo "白名单放行: ${VALID_WL[*]} → $DIRECT_OUTBOUND"
-[[ ${#VALID_AD[@]} -gt 0 ]] && echo "广告屏蔽:   ${VALID_AD[*]} → $BLOCK_OUTBOUND"
-echo ""
-
-echo "当前路由规则顺序:"
-jq -r '
-  (.route.rules // []) as $rules |
-  range(0; $rules|length) as $i |
-  $rules[$i] as $r |
-  if $r.rule_set then
-    "  [" + ($i|tostring) + "] rule_set=" +
-    (if ($r.rule_set|type)=="array" then ($r.rule_set|join(",")) else $r.rule_set end) +
-    "  outbound=" + ($r.outbound // "-")
-  elif $r.domain_regex then
-    "  [" + ($i|tostring) + "] domain_regex (" + (($r.domain_regex|length)|tostring) + " 条)  outbound=" + ($r.outbound // "-")
-  elif $r.action then
-    "  [" + ($i|tostring) + "] action=" + $r.action
-  else
-    "  [" + ($i|tostring) + "] " + ($r|tostring)
-  end
-' "$CONFIG"
-
-echo ""
-
-echo "[信息] 校验配置..."
-set +e
-CHECK_RESULT="$("$SINGBOX_BIN" check -c "$CONFIG" 2>&1)"
-CHECK_STATUS=$?
-set -e
-
-if [[ $CHECK_STATUS -ne 0 ]]; then
-  err "配置校验失败，回滚！"
-  echo "$CHECK_RESULT"
-  cp "$BACKUP" "$CONFIG"
-  log "已回滚到备份"
-  exit 1
-fi
-
-log "配置校验通过"
-
-echo "[信息] 重启 sing-box..."
-if ! systemctl restart sing-box; then
-  err "sing-box 重启失败，回滚！"
+  err "sing-box 60 秒内未启动，回滚！"
   cp "$BACKUP" "$CONFIG"
   systemctl restart sing-box || true
   log "已回滚并尝试重启"
   exit 1
-fi
+}
 
-echo "[信息] 等待 sing-box 启动..."
-for i in $(seq 1 30); do
-  sleep 2
-  if systemctl is-active --quiet sing-box; then
-    echo "[完成] sing-box 运行中 ✓（等待了 $((i*2)) 秒）"
-    setup_auto_refresh
-    exit 0
+do_inject() {
+  VALID_WL_STR="$(precheck_tags "白名单" "${WHITELIST_TAGS[@]}")"
+  VALID_WL=($VALID_WL_STR)
+  echo ""
+
+  VALID_AD_STR="$(precheck_tags "广告屏蔽" "${AD_BLOCK_TAGS[@]}")"
+  VALID_AD=($VALID_AD_STR)
+  echo ""
+
+  if [[ ${#VALID_WL[@]} -eq 0 && ${#VALID_AD[@]} -eq 0 ]]; then
+    err "所有规则集均不可用，退出"
+    exit 1
   fi
-done
 
-err "sing-box 60 秒内未启动，回滚！"
-cp "$BACKUP" "$CONFIG"
-systemctl restart sing-box || true
-log "已回滚并尝试重启"
-exit 1
+  cp "$CONFIG" "$BACKUP"
+  log "已备份到 $BACKUP"
+
+  DIRECT_OUTBOUND="$(detect_outbound_by_type "direct" "01_direct_outbound" "direct" "direct_outbound" "DIRECT" "🇨🇳直连" "🎯直连")"
+
+  if [[ -z "$DIRECT_OUTBOUND" ]]; then
+    DIRECT_OUTBOUND="direct_outbound"
+    ensure_outbound_exists "$DIRECT_OUTBOUND" "direct"
+    warn "未检测到 direct 出站，已自动添加: $DIRECT_OUTBOUND"
+  else
+    log "检测到直连出站: $DIRECT_OUTBOUND"
+  fi
+
+  BLOCK_OUTBOUND="$(detect_outbound_by_type "block" "block_ip_outbound" "block" "block_outbound" "reject")"
+
+  if [[ ${#VALID_AD[@]} -gt 0 ]]; then
+    if [[ -z "$BLOCK_OUTBOUND" ]]; then
+      BLOCK_OUTBOUND="block_ip_outbound"
+      ensure_outbound_exists "$BLOCK_OUTBOUND" "block"
+      warn "未检测到 block 出站，已自动添加: $BLOCK_OUTBOUND"
+    else
+      log "检测到拦截出站: $BLOCK_OUTBOUND"
+    fi
+  fi
+
+  strip_injected
+
+  WL_RSETS_JSON="[]"
+  for tag in "${VALID_WL[@]}"; do
+    WL_RSETS_JSON="$(printf '%s' "$WL_RSETS_JSON" | jq -c \
+      --arg tag "whitelist-${tag}" \
+      --arg url "${URL_PREFIX}/${tag}.srs" \
+      --arg detour "$DIRECT_OUTBOUND" \
+      '. + [{"type":"remote","tag":$tag,"format":"binary","url":$url,"download_detour":$detour,"update_interval":"24h"}]')"
+  done
+
+  WL_REFS_JSON="[]"
+  for tag in "${VALID_WL[@]}"; do
+    WL_REFS_JSON="$(printf '%s' "$WL_REFS_JSON" | jq -c --arg t "whitelist-${tag}" '. + [$t]')"
+  done
+
+  AD_RSETS_JSON="[]"
+  for tag in "${VALID_AD[@]}"; do
+    AD_RSETS_JSON="$(printf '%s' "$AD_RSETS_JSON" | jq -c \
+      --arg tag "adblock-${tag}" \
+      --arg url "${URL_PREFIX}/${tag}.srs" \
+      --arg detour "$DIRECT_OUTBOUND" \
+      '. + [{"type":"remote","tag":$tag,"format":"binary","url":$url,"download_detour":$detour,"update_interval":"24h"}]')"
+  done
+
+  AD_REFS_JSON="[]"
+  for tag in "${VALID_AD[@]}"; do
+    AD_REFS_JSON="$(printf '%s' "$AD_REFS_JSON" | jq -c --arg t "adblock-${tag}" '. + [$t]')"
+  done
+
+  TMP_CONFIG="$(mktemp)"
+
+  # 注入并整理 route.rules 顺序：
+  # [0] sniff
+  # [1] 原有放行/其它前置规则，例如 Apple 放行
+  # [2] 广告屏蔽（置于白名单之前：白名单含 geolocation-!cn 等大范围
+  #     直连规则，若白名单在前，非 CN 广告域名会先命中直连绕过屏蔽）
+  # [3] 白名单放行
+  # [4] 中国域名屏蔽
+  # [5] 中国 IP 屏蔽
+  # [6] 原本在 CN 屏蔽后面的其它规则，保持在后面
+  jq --argjson wl_rsets "$WL_RSETS_JSON" \
+     --argjson wl_refs  "$WL_REFS_JSON"  \
+     --argjson ad_rsets "$AD_RSETS_JSON" \
+     --argjson ad_refs  "$AD_REFS_JSON"  \
+     --arg     direct_out "$DIRECT_OUTBOUND" \
+     --arg     block_out  "$BLOCK_OUTBOUND" \
+     '
+     def arr(x): if (x|type)=="array" then x else [x] end;
+     def refs: if .rule_set? then arr(.rule_set) else [] end;
+
+     def is_sniff:
+       .action? == "sniff";
+
+     def is_cn_domain_block:
+       (.rule_set? != null) and
+       (refs | any(
+         . == "cn_cn_block_route" or
+         test("(^|[-_])geosite[-_]?cn($|[-_])"; "i") or
+         test("^cn[_-]cn[_-]block[_-]route$"; "i") or
+         test("(^|[-_])cn[-_]?block[-_]?route$"; "i")
+       ));
+
+     def is_cn_ip_block:
+       (.rule_set? != null) and
+       (refs | any(
+         . == "geoip_cn_cn_block_ip_route" or
+         test("(^|[-_])geoip[-_]?cn($|[-_])"; "i") or
+         test("cn[-_]?block[-_]?ip"; "i")
+       ));
+
+     .route //= {} |
+     .route.rule_set //= [] |
+     .route.rules //= [] |
+
+     .route.rule_set += $ad_rsets + $wl_rsets |
+
+     .route.rules as $rules |
+
+     (
+       $rules
+       | to_entries
+       | map(select(.value | (is_cn_domain_block or is_cn_ip_block)))
+       | .[0].key // ($rules | length)
+     ) as $cn_idx |
+
+     ($rules | map(select(is_sniff))) as $sniff_rules |
+     ($rules | map(select(is_cn_domain_block))) as $cn_domain_rules |
+     ($rules | map(select(is_cn_ip_block))) as $cn_ip_rules |
+
+     ($rules[:$cn_idx] | map(select((is_sniff or is_cn_domain_block or is_cn_ip_block) | not))) as $before_cn |
+     ($rules[$cn_idx:] | map(select((is_sniff or is_cn_domain_block or is_cn_ip_block) | not))) as $after_cn |
+
+     .route.rules = (
+       $sniff_rules +
+       $before_cn +
+       (if ($ad_refs | length) > 0 then [{"rule_set": $ad_refs, "outbound": $block_out}] else [] end) +
+       (if ($wl_refs | length) > 0 then [{"rule_set": $wl_refs, "outbound": $direct_out}] else [] end) +
+       $cn_domain_rules +
+       $cn_ip_rules +
+       $after_cn
+     )
+     ' "$CONFIG" > "$TMP_CONFIG"
+
+  mv "$TMP_CONFIG" "$CONFIG"
+  TMP_CONFIG=""
+
+  echo ""
+  echo "[完成] 注入成功！"
+  [[ ${#VALID_AD[@]} -gt 0 ]] && echo "广告屏蔽:   ${VALID_AD[*]} → $BLOCK_OUTBOUND"
+  [[ ${#VALID_WL[@]} -gt 0 ]] && echo "白名单放行: ${VALID_WL[*]} → $DIRECT_OUTBOUND"
+  echo ""
+
+  echo "当前路由规则顺序:"
+  jq -r '
+    (.route.rules // []) as $rules |
+    range(0; $rules|length) as $i |
+    $rules[$i] as $r |
+    if $r.rule_set then
+      "  [" + ($i|tostring) + "] rule_set=" +
+      (if ($r.rule_set|type)=="array" then ($r.rule_set|join(",")) else $r.rule_set end) +
+      "  outbound=" + ($r.outbound // "-")
+    elif $r.domain_regex then
+      "  [" + ($i|tostring) + "] domain_regex (" + (($r.domain_regex|length)|tostring) + " 条)  outbound=" + ($r.outbound // "-")
+    elif $r.action then
+      "  [" + ($i|tostring) + "] action=" + $r.action
+    else
+      "  [" + ($i|tostring) + "] " + ($r|tostring)
+    end
+  ' "$CONFIG"
+
+  echo ""
+
+  validate_and_restart
+  setup_auto_refresh
+}
+
+do_remove() {
+  cp "$CONFIG" "$BACKUP"
+  log "已备份到 $BACKUP"
+
+  strip_injected
+  log "已从配置中移除全部 whitelist-/adblock- 注入规则"
+
+  validate_and_restart
+
+  rm -f "$CRON_FILE"
+  log "已删除定时任务: $CRON_FILE"
+
+  # 最后删除本地脚本（正在执行的副本删除后不再读取新内容，安全）
+  rm -f "$SCRIPT_INSTALL"
+  log "已删除本地脚本: $SCRIPT_INSTALL"
+
+  echo ""
+  echo "[完成] 卸载完成，sing-box 配置已恢复为无注入状态"
+  exit 0
+}
+
+# ── 动作选择：参数优先，交互弹菜单，非交互（cron/管道）默认更新 ──────────────
+ACTION="${1:-}"
+case "$ACTION" in
+  1|install)          ACTION="install" ;;
+  2|update)           ACTION="update" ;;
+  0|remove|uninstall) ACTION="remove" ;;
+  "")
+    if [ -t 0 ]; then
+      echo ""
+      echo "========= whitelist-inject v2.7 ========="
+      echo "  1. 安装（注入规则 + 每日自动刷新）"
+      echo "  2. 更新（拉最新脚本与规则集后重新注入）"
+      echo "  0. 删除（移除注入规则、定时任务与本地脚本）"
+      echo "========================================="
+      while true; do
+        read -r -p "请选择 [1/2/0]: " _choice || _choice=""
+        case "$_choice" in
+          1) ACTION="install"; break ;;
+          2) ACTION="update";  break ;;
+          0) ACTION="remove";  break ;;
+          *) echo "无效输入，请输入 1、2 或 0" ;;
+        esac
+      done
+    else
+      ACTION="update"
+    fi
+    ;;
+  *)
+    err "未知参数: $ACTION（可用: 1|install  2|update  0|remove）"
+    exit 1
+    ;;
+esac
+
+require_env
+
+case "$ACTION" in
+  install)
+    log "执行安装..."
+    do_inject
+    ;;
+  update)
+    log "执行更新..."
+    do_inject
+    ;;
+  remove)
+    log "执行卸载..."
+    do_remove
+    ;;
+esac
