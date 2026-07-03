@@ -73,8 +73,9 @@ def extract_rules_from_payload(payload):
             if len(parts) >= 2:
                 cidr = parts[1]
                 try:
-                    ipaddress.ip_network(cidr, strict=False)
-                    cidrs.add(cidr)
+                    # 存规范化形式：裸 IP 补掩码（mihomo convert-ruleset
+                    # 遇到不带掩码的裸 IP 会直接 panic）、IPv6 小写
+                    cidrs.add(str(ipaddress.ip_network(cidr, strict=False)))
                 except ValueError:
                     pass
             continue
