@@ -1,3 +1,5 @@
 remote-tmp/
 mihomo
 sing-box
+__pycache__/
+*.pyc
