@@ -320,14 +320,13 @@ def extract_supported_from_clash_lines(rule_lines: list) -> dict:
             b["domain_regex"].add(v)
         elif t == "IP-CIDR":
             try:
-                ipaddress.ip_network(v, strict=False)
-                b["ip_cidr"].add(v)
+                # 规范化：裸 IP 补掩码（mihomo 编译裸 IP 会 panic）
+                b["ip_cidr"].add(str(ipaddress.ip_network(v, strict=False)))
             except ValueError:
                 pass
         elif t == "IP-CIDR6":
             try:
-                ipaddress.ip_network(v, strict=False)
-                b["ip_cidr6"].add(v)
+                b["ip_cidr6"].add(str(ipaddress.ip_network(v, strict=False)))
             except ValueError:
                 pass
         elif t == "PROCESS-NAME":
@@ -420,9 +419,9 @@ def parse_cidr_list(raw_text: str):
         try:
             net = ipaddress.ip_network(s, strict=False)
             if net.version == 4:
-                v4.add(s)
+                v4.add(str(net))
             else:
-                v6.add(s)
+                v6.add(str(net))
         except Exception:
             pass
 
@@ -790,7 +789,10 @@ def main() -> None:
                         domains.append("+." + ds.strip().lstrip("+."))
                 for c in r.get("ip_cidr") or []:
                     if isinstance(c, str) and c.strip():
-                        cidrs.append(c.strip())
+                        try:
+                            cidrs.append(str(ipaddress.ip_network(c.strip(), strict=False)))
+                        except ValueError:
+                            pass
 
             domains = sorted(set(domains))
             cidrs = sorted(set(cidrs))
