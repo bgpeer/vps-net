@@ -51,7 +51,7 @@ def extract_rules_from_payload(payload):
         # ---------- 域名规则 ----------
         # behavior=domain payload 只支持精确匹配和后缀匹配：
         #   DOMAIN         → 精确匹配，不加点
-        #   DOMAIN-SUFFIX  → 后缀匹配，补充前导点
+        #   DOMAIN-SUFFIX  → 后缀匹配，用 +. 前缀（.x 只匹配子域名，不含主域名）
         #   DOMAIN-KEYWORD / DOMAIN-WILDCARD / DOMAIN-REGEX → 不支持，跳过
         if stripped.startswith("DOMAIN") and not stripped.startswith("DOMAIN-REGEX"):
             parts = [p.strip() for p in line.split(",") if p.strip()]
@@ -61,7 +61,8 @@ def extract_rules_from_payload(payload):
                 if rule_type == "DOMAIN":
                     domains.add(val)
                 elif rule_type == "DOMAIN-SUFFIX":
-                    domains.add(val if val.startswith(".") else "." + val)
+                    # mihomo trie: ".x" 只匹配子域名，"+.x" 才含主域名（源码实证）
+                    domains.add("+." + val.lstrip("+."))
                 # DOMAIN-KEYWORD / DOMAIN-WILDCARD: behavior=domain 不支持，跳过
             continue
 
