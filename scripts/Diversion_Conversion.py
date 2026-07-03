@@ -785,11 +785,9 @@ def main() -> None:
                         domains.append(d.strip().lstrip("."))
                 for ds in r.get("domain_suffix") or []:
                     if isinstance(ds, str) and ds.strip():
-                        vv = ds.strip()
-                        # MRS behavior=domain: 后缀匹配需要保留/补充前导点
-                        if not vv.startswith("."):
-                            vv = "." + vv
-                        domains.append(vv)
+                        # mihomo trie: ".x" 只匹配子域名，"+.x" 才含主域名
+                        # （源码实证），后缀匹配必须用 "+."
+                        domains.append("+." + ds.strip().lstrip("+."))
                 for c in r.get("ip_cidr") or []:
                     if isinstance(c, str) and c.strip():
                         cidrs.append(c.strip())
@@ -886,7 +884,7 @@ def main() -> None:
         # 给 mihomo 出 MRS（domain / ipcidr）
         # behavior=domain payload：
         #   - domain       → 精确匹配，不加点
-        #   - domain_suffix → 后缀匹配，保留/补充前导点
+        #   - domain_suffix → 后缀匹配，用 +. 前缀（.x 只匹配子域名，不含主域名）
         #   - domain_keyword / domain_wildcard → behavior=domain 不支持，跳过
         domains_for_mrs = []
         for d in b["domain"]:
