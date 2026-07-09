@@ -25,7 +25,7 @@ BACKUP="${CONFIG}.bak.$(date +%s)"
 WHITELIST_TAGS=(
   "bytedance"
   "tiktok"
-  "wildrift"
+  "category-games-!cn"
   "bilibili"
   "xiaohongshu"
   "alibaba"
