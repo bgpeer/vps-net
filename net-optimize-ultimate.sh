@@ -154,6 +154,11 @@ MSS_USER_SET="${MSS_VALUE:+1}"  # 用户显式指定 MSS 时跳过自动探测
 : "${ENABLE_DSCP:=1}"           # QUIC/UDP DSCP 优先级标记
 : "${ENABLE_INITCWND:=1}"       # 自动检测线路质量调整 initcwnd
 : "${TCP_NOTSENT_LOWAT:=4096}"  # 代理场景低延迟（默认 4096，原 16384）
+# 代理节点监听端口从临时端口池中保留：出站临时端口不再占用这些口，
+# 避免节点(sing-box/xray)重启时监听口偶发被临时连接占住而 bind 失败。
+# 默认覆盖 nodekit 端口段：15000-45000(协议随机口) + 20080(订阅) + 30000-31000(hy2跳跃)。
+# 注意：这段会从临时端口池挖掉，普通自用无碍；超高并发中转想要更大临时池可缩小或置空。
+: "${RESERVED_PORTS:=15000-45000,20080,30000-31000}"
 : "${AGGRESSIVE_MODE:=0}"      # 激进模式：抢带宽（类似 Hy2 暴力发包思路）
 : "${ENABLE_GAME_QOS:=1}"      # 游戏低延迟 QoS（cake/prio 双方案自动选择）
 : "${ADAPTIVE_QOS:=1}"         # 自适应 QoS：流量高→抢带宽，流量低→游戏低延迟（自动切换）
@@ -701,6 +706,8 @@ write_sysctl_conf() {
     echo "net.ipv4.tcp_keepalive_probes = 2"
     echo "net.ipv4.tcp_max_tw_buckets = 32768"
     echo "net.ipv4.ip_local_port_range = 1024 65535"
+    # 代理节点监听口从临时端口池保留，避免出站临时端口撞上节点监听口
+    [ -n "$RESERVED_PORTS" ] && echo "net.ipv4.ip_local_reserved_ports = $RESERVED_PORTS"
     echo
 
     echo "# === TCP算法优化 ==="
