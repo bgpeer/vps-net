@@ -1,5 +1,5 @@
 #!/bin/bash
-# whitelist-inject.sh v2.7.1
+# whitelist-inject.sh v2.7.2
 # v2ray-agent(mack-a) sing-box：注入广告屏蔽 + 白名单放行规则
 # 规则顺序：广告屏蔽 → 白名单放行 → CN 屏蔽（广告优先，白名单内服务的广告同样被拦截）
 #
@@ -299,12 +299,12 @@ strip_injected() {
   TMP_CONFIG=""
 }
 
-# 校验配置并重启 sing-box；任何一步失败都回滚备份。
-# 配置与备份完全一致时跳过重启（避免每日 cron 无谓中断连接）。
-validate_and_restart() {
+# 同步校验配置。配置与备份完全一致 → 返回 1（无需重启，避免每日 cron 无谓中断连接）；
+# 有变化且校验通过 → 返回 0；校验失败 → 回滚备份并退出（坏配置绝不会被重启，单台 VPS 不会被锁死）。
+validate_config() {
   if cmp -s "$CONFIG" "$BACKUP"; then
     log "配置无变化，跳过校验与重启"
-    return 0
+    return 1
   fi
 
   echo "[信息] 校验配置..."
@@ -322,7 +322,11 @@ validate_and_restart() {
   fi
 
   log "配置校验通过"
+  return 0
+}
 
+# 同步重启 + 启动校验 + 失败回滚（没有 setsid 时的兜底路径，直连管理下工作正常）。
+_restart_singbox_sync() {
   echo "[信息] 重启 sing-box..."
   if ! systemctl restart sing-box; then
     err "sing-box 重启失败，回滚！"
@@ -347,6 +351,37 @@ validate_and_restart() {
   systemctl restart sing-box || true
   log "已回滚并尝试重启"
   exit 1
+}
+
+# 后台看门狗重启：重启 + 启动校验 + 起不来自动回滚，全部放进独立会话（setsid）里跑。
+# 这样即便你挂着本机代理来管理、重启掐断了 SSH，这套动作也会在服务端完整跑完——
+# 不会因为 SSH 断了就半途而废（规则没落全 / 定时任务没装），也不会让起不来的核心把单台 VPS 锁死。
+restart_singbox_bg() {
+  if ! command -v setsid >/dev/null 2>&1; then
+    _restart_singbox_sync
+    return
+  fi
+  echo "[信息] 后台重启 sing-box（若你正挂本机代理管理，SSH 可能瞬断，属正常；配置已校验通过并落盘）..."
+  setsid bash -c '
+    CONFIG="$1"; BACKUP="$2"
+    if ! systemctl restart sing-box; then
+      echo "[看门狗] 重启失败，回滚到改动前配置"; cp "$BACKUP" "$CONFIG"; systemctl restart sing-box || true; exit 1
+    fi
+    for i in $(seq 1 30); do
+      sleep 2
+      if systemctl is-active --quiet sing-box; then echo "[看门狗] sing-box 运行中 ✓"; exit 0; fi
+    done
+    echo "[看门狗] 60s 未启动，回滚到改动前配置"; cp "$BACKUP" "$CONFIG"; systemctl restart sing-box || true; exit 1
+  ' _ "$CONFIG" "$BACKUP" </dev/null >>"$CRON_LOG" 2>&1 &
+  disown 2>/dev/null || true
+  log "重启看门狗已在后台运行（日志: $CRON_LOG）；几秒后 sing-box 即带新规则运行。"
+}
+
+# 兼容旧调用：校验通过且有变化才重启（do_remove 用）。
+validate_and_restart() {
+  if validate_config; then
+    restart_singbox_bg
+  fi
 }
 
 do_inject() {
@@ -521,8 +556,14 @@ do_inject() {
 
   echo ""
 
-  validate_and_restart
-  setup_auto_refresh
+  # 顺序很重要：先同步校验（坏配置当场回滚退出）→ 再把定时任务/脚本落盘 → 最后后台重启。
+  # 这样即便随后重启掐断 SSH，规则已写入、定时任务已装好，重启也会由看门狗在服务端跑完。
+  if validate_config; then
+    setup_auto_refresh
+    restart_singbox_bg
+  else
+    setup_auto_refresh
+  fi
 }
 
 do_remove() {
@@ -558,7 +599,7 @@ case "$ACTION" in
   "")
     if [ -t 0 ]; then
       echo ""
-      echo "========= whitelist-inject v2.7.1 ========="
+      echo "========= whitelist-inject v2.7.2 ========="
       echo "  1. 安装（注入规则 + 每日自动刷新）"
       echo "  2. 更新（拉最新脚本与规则集后重新注入）"
       echo "  0. 删除（移除注入规则、定时任务与本地脚本）"
