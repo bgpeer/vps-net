@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v3.8.0
+# 🚀 Net-Optimize-Ultimate v3.8.1
 # 功能：深度整合优化 + UDP活跃修复 + 智能检测 + 安全持久化
+# v3.8.1 修复：
+#   1) 检测到容器运行时(Docker/containerd/podman/k8s)时不再设 vm.overcommit_memory=2。
+#      严格提交记账会把 Go 写的容器工具链预留的虚拟地址计入 commit，十几个容器
+#      即顶满 CommitLimit，导致物理内存充足却起不来容器、报
+#      "write init-p: broken pipe"，且 dmesg 无 OOM 记录，极难排查。
 # v3.8.0 新增：
 #   1) MSS 自动探测：按实际路径 MTU 推导（裸线路 1460 / WG 隧道防分片）
 #   2) UDP GRO 转发 + 发送分段卸载通用开启（QUIC/Hysteria2/TUIC 降 CPU）
@@ -132,7 +137,7 @@ install -Dm755 "$0" "$SCRIPT_PATH" 2>/dev/null || true
 
 trap 'code=$?; echo "❌ 出错：第 ${BASH_LINENO[0]} 行 -> ${BASH_COMMAND} (退出码 $code)"; exit $code' ERR
 
-echo "🚀 Net-Optimize-Ultimate v3.8.0 开始执行..."
+echo "🚀 Net-Optimize-Ultimate v3.8.1 开始执行..."
 echo "========================================================"
 
 # === 2. 全局配置开关 ===
@@ -191,6 +196,18 @@ require_root() {
 }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# 本机是否存在容器运行时（Docker / containerd / podman / k8s）。
+# 用于决定 vm.overcommit_memory 取值,详见写入 sysctl 处的注释。
+container_runtime_present() {
+  local c
+  for c in docker containerd podman runc k3s kubelet; do
+    have_cmd "$c" && return 0
+  done
+  [[ -S /var/run/docker.sock || -S /run/docker.sock \
+     || -S /run/containerd/containerd.sock ]] && return 0
+  return 1
+}
 
 has_sysctl_key() {
   local p="/proc/sys/${1//.//}"
@@ -677,7 +694,7 @@ write_sysctl_conf() {
 
   {
     echo "# ========================================================="
-    echo "# 🚀 Net-Optimize Ultimate v3.8.0 - Kernel Parameters"
+    echo "# 🚀 Net-Optimize Ultimate v3.8.1 - Kernel Parameters"
     echo "# Generated: $(date -u '+%F %T UTC')"
     echo "# ========================================================="
     echo
@@ -824,8 +841,21 @@ write_sysctl_conf() {
     echo "vm.mmap_min_addr = 65536"
     echo "vm.max_map_count = 1048576"
     echo "vm.swappiness = 1"
-    echo "vm.overcommit_memory = 2"  # 适度超量（commit_limit=swap+RAM*ratio%），避免 = 1 彻底关闭 OOM 保护导致内存耗尽
-    echo "vm.overcommit_ratio = 100"  # 默认 ratio=50 时无 swap 小内存机 commit 上限仅半个 RAM，大分配会直接失败
+    # overcommit_memory=2 是严格提交记账：所有进程申请的虚拟内存总和不得超过
+    # CommitLimit(= swap + RAM*ratio%)。纯代理节点上没问题，但容器工具链
+    # (dockerd/containerd/containerd-shim/runc) 全是 Go 写的，Go 运行时启动时会
+    # 预留大片虚拟地址空间——预留不占物理内存，可严格模式照样计入 commit。
+    # 每起一个容器要拉起 shim + runc 两个 Go 进程，十几个容器就能顶满 CommitLimit，
+    # 表现为：物理内存充足、swap 没动、dmesg 里没有任何 OOM kill，只有
+    # __vm_enough_memory 报错，容器随机起不来并崩在 "write init-p: broken pipe"。
+    # 这种症状极难联想到 sysctl，排查成本很高，故检测到容器运行时就退回
+    # 内核默认的启发式模式 0。注意 0 不会关闭 OOM killer（那是另一套机制）。
+    if container_runtime_present; then
+      echo "vm.overcommit_memory = 0"   # 检测到容器运行时 → 内核默认启发式
+    else
+      echo "vm.overcommit_memory = 2"   # 严格提交记账，避免 = 1 完全不设防
+      echo "vm.overcommit_ratio = 100"  # 默认 ratio=50 时无 swap 小内存机 commit 上限仅半个 RAM，大分配会直接失败
+    fi
     echo "kernel.pid_max = 4194304"
     echo
     echo "fs.protected_fifos = 1"
@@ -2843,7 +2873,7 @@ _final_ef="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -c
 _final_af41="$(iptables-legacy -w 2 -t mangle -S POSTROUTING 2>/dev/null | grep -cE '0x22|dscp-class AF41|set-dscp 34' || true)"
 logger -t net-optimize "BOOT: 最终 TCPMSS=$_final_tcpmss EF=$_final_ef AF41=$_final_af41"
 
-echo "[$(date)] Net-Optimize v3.8.0 开机优化完成"
+echo "[$(date)] Net-Optimize v3.8.1 开机优化完成"
 APPLYEOF
 
   chmod +x "$APPLY_SCRIPT"
@@ -3094,7 +3124,7 @@ main() {
   require_root
   _ensure_swap
 
-  echo "🚀 Net-Optimize-Ultimate v3.8.0 启动..."
+  echo "🚀 Net-Optimize-Ultimate v3.8.1 启动..."
   echo "========================================================"
 
   clean_old_config
