@@ -131,7 +131,15 @@ echo "  🔹 wmem_default = $(get net.core.wmem_default)"
 echo "  🔹 wmem_max     = $(get net.core.wmem_max)"
 echo "  🔹 netdev_max_backlog = $(get net.core.netdev_max_backlog)"
 echo "✅ 内存提交策略（v3.8.0：ratio=100 防无 swap 小内存机大分配失败）："
-echo "  🔹 vm.overcommit_memory = $(get vm.overcommit_memory)  vm.overcommit_ratio = $(get vm.overcommit_ratio)"
+_oc="$(get vm.overcommit_memory)"
+echo "  🔹 vm.overcommit_memory = ${_oc}  vm.overcommit_ratio = $(get vm.overcommit_ratio)"
+if [[ "$_oc" == "2" ]] && { command -v docker >/dev/null 2>&1 \
+     || command -v containerd >/dev/null 2>&1 || [[ -S /var/run/docker.sock ]]; }; then
+  yellow "  ⚠️ 本机有容器运行时，但仍是严格提交记账(=2)，两者不兼容："
+  yellow "     容器会随机起不来，报 write init-p: broken pipe，"
+  yellow "     而 dmesg 里只有 __vm_enough_memory、没有 OOM，极易误判为内存不足。"
+  yellow "     修复：sysctl -w vm.overcommit_memory=0（重跑优化脚本也会自动改）"
+fi
 
 rp="$(get net.ipv4.conf.all.rp_filter)"
 case "$rp" in
