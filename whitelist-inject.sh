@@ -51,6 +51,31 @@ LOGROTATE_FILE="/etc/logrotate.d/whitelist-inject"
 # cron 每天跑的是本地副本，仓库里改了 WHITELIST_TAGS 等名单后，
 # 必须先拉最新脚本再执行，否则名单永远停留在部署那一刻。
 # 注意：下载内容落盘后再算哈希（命令替换会剥末尾换行导致校验永远失败）。
+# 北京时间 HH MM（第 4 个参数给了 = 每月那一号）→ /etc/cron.d 里的行，逐行输出。
+# Debian/Ubuntu 的 cron 不认 CRON_TZ，只能按本机时区写；美国 / 欧洲 / 澳洲有夏令时，同一个北京时刻
+# 冬夏差一小时。所以按今年 1 月、7 月各换算一次都写上，每行前面用北京时间（TZ=CST-8，不依赖 tzdata）
+# 再核对，只有对的那行真跑。没有夏令时的时区只有一行。每月任务日期写 *，由核对里的「几号」把关。
+bj_cron_lines() {
+  local hh=$1 mm=$2 cmd=$3 day=${4:-} y fmt want seen="" t mon
+  y=$(date +%Y)
+  if [[ -n "$day" ]]; then
+    fmt='\%d\%H'; want=$(printf '%02d%02d' "$((10#$day))" "$((10#$hh))")
+  else
+    fmt='\%H'; want=$(printf '%02d' "$((10#$hh))")
+  fi
+  for mon in 01 07; do
+    t=$(date -d "${y}-${mon}-15 ${hh}:${mm} +0800" '+%-M %-H' 2>/dev/null) || continue
+    [[ " $seen " == *" ${t/ /_} "* ]] && continue
+    seen+=" ${t/ /_}"
+    echo "$t * * * root [ \"\$(TZ=CST-8 date +${fmt})\" = \"${want}\" ] && ${cmd}"
+  done
+  # date 不支持 -d（极少见）：退回按当前偏移换算一次，至少不丢任务
+  if [[ -z "$seen" ]]; then
+    local off=$(( $(date +%-H) - $(TZ=CST-8 date +%-H) )); local lh=$(( (10#$hh + off + 24) % 24 ))
+    echo "$((10#$mm)) $lh * * * root [ \"\$(TZ=CST-8 date +${fmt})\" = \"${want}\" ] && ${cmd}"
+  fi
+}
+
 auto_update() {
   command -v curl >/dev/null 2>&1 || return 0
   command -v sha256sum >/dev/null 2>&1 || return 0
@@ -136,14 +161,14 @@ setup_auto_refresh() {
 
   chmod 755 "$SCRIPT_INSTALL"
 
-  cat > "$CRON_FILE" <<CRON_EOF
-# whitelist-inject 规则集每日自动刷新
-# 执行时间: 北京时间 03:00（UTC 19:00）
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-CRON_TZ=UTC
-0 19 * * * root $SCRIPT_INSTALL update >> $CRON_LOG 2>&1
-CRON_EOF
+  # 原来是 CRON_TZ=UTC —— Debian/Ubuntu 的 cron 不认，只有本机本来就是 UTC 时才碰巧对。
+  {
+    echo "# whitelist-inject 规则集每日自动刷新"
+    echo "# 执行时间: 北京时间 03:00（按本机时区换算，夏令时冬夏两行，到点核对北京钟点）"
+    echo "SHELL=/bin/bash"
+    echo "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin"
+    bj_cron_lines 03 00 "$SCRIPT_INSTALL update >> $CRON_LOG 2>&1"
+  } > "$CRON_FILE"
 
   chmod 644 "$CRON_FILE"
 

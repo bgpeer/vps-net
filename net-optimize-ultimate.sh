@@ -2269,6 +2269,31 @@ EOF
 }
 
 # === 11. Nginx 安装 + 自动更新 ===
+# 北京时间 HH MM（第 4 个参数给了 = 每月那一号）→ /etc/cron.d 里的行，逐行输出。
+# Debian/Ubuntu 的 cron 不认 CRON_TZ，只能按本机时区写；美国 / 欧洲 / 澳洲有夏令时，同一个北京时刻
+# 冬夏差一小时。所以按今年 1 月、7 月各换算一次都写上，每行前面用北京时间（TZ=CST-8，不依赖 tzdata）
+# 再核对，只有对的那行真跑。没有夏令时的时区只有一行。每月任务日期写 *，由核对里的「几号」把关。
+bj_cron_lines() {
+  local hh=$1 mm=$2 cmd=$3 day=${4:-} y fmt want seen="" t mon
+  y=$(date +%Y)
+  if [[ -n "$day" ]]; then
+    fmt='\%d\%H'; want=$(printf '%02d%02d' "$((10#$day))" "$((10#$hh))")
+  else
+    fmt='\%H'; want=$(printf '%02d' "$((10#$hh))")
+  fi
+  for mon in 01 07; do
+    t=$(date -d "${y}-${mon}-15 ${hh}:${mm} +0800" '+%-M %-H' 2>/dev/null) || continue
+    [[ " $seen " == *" ${t/ /_} "* ]] && continue
+    seen+=" ${t/ /_}"
+    echo "$t * * * root [ \"\$(TZ=CST-8 date +${fmt})\" = \"${want}\" ] && ${cmd}"
+  done
+  # date 不支持 -d（极少见）：退回按当前偏移换算一次，至少不丢任务
+  if [[ -z "$seen" ]]; then
+    local off=$(( $(date +%-H) - $(TZ=CST-8 date +%-H) )); local lh=$(( (10#$hh + off + 24) % 24 ))
+    echo "$((10#$mm)) $lh * * * root [ \"\$(TZ=CST-8 date +${fmt})\" = \"${want}\" ] && ${cmd}"
+  fi
+}
+
 fix_nginx_repo() {
   if [ "${ENABLE_NGINX_REPO:-0}" != "1" ]; then
     echo "⏭️ 跳过 Nginx 管理"
@@ -2502,13 +2527,13 @@ UPGRADEEOF
   "$nginx_upgrade_script" || true
 
   # ---------- 6) 不执行主脚本时，每月 1 号 03:00 自动更新 ----------
-  cat > "$cron_file" <<EOF
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-CRON_TZ=Asia/Shanghai
-# Net-Optimize: monthly nginx install/upgrade at Beijing time, official nginx.org repo has Pin-Priority=1001
-10 3 1 * * root $nginx_upgrade_script
-EOF
+  # 原来是 CRON_TZ=Asia/Shanghai —— Debian/Ubuntu 的 cron 不认，实际按本机时区跑（UTC 机器上是北京 11:10）
+  {
+    echo "SHELL=/bin/bash"
+    echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    echo "# Net-Optimize: monthly nginx install/upgrade, 北京时间每月 1 号 03:10（本机时区换算 + 到点核对）"
+    bj_cron_lines 03 10 "$nginx_upgrade_script" 01
+  } > "$cron_file"
 
   chmod 644 "$cron_file"
   echo "✅ 已配置 Nginx 自动更新 cron：北京时间每月 1 号 03:10"
