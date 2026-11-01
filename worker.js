@@ -109,29 +109,61 @@ async function tgSend(env, chatId, text) {
 }
 
 // -------------------- Workers AI --------------------
+//
+// 「现在不智能了」的原因：原来用 8B 小模型 + 拼字符串的 prompt（"用户：…\n助手："）。
+// 这种写法不走模型自己的对话模板，小模型会顺着往下编，自问自答出一串「用户：… 助手：… #标签」。
+// 现在改成 messages（system / user 分开，走对话模板），默认换成中文好得多的 Qwen3 30B，
+// 它出错 / 不可用时退回 Llama 3.3 70B。想换模型在 Worker 的变量里设 AI_MODEL，不用改代码。
+
+const MODELS = [
+  "@cf/qwen/qwen3-30b-a3b-fp8",
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+];
 
 async function callWorkersAI(env, userText) {
   if (!env.AI) {
-    throw new Error('Workers AI 未绑定：请在 wrangler.toml 添加 [ai]\\nbinding="AI" 并重新部署');
+    throw new Error('Workers AI 未绑定：请在 wrangler.toml 添加 [ai]\nbinding="AI" 并重新部署');
   }
-
-  // Fast, good enough for chat. You can switch to non-fast if you prefer.
-  const model = "@cf/meta/llama-3.1-8b-instruct-fast";
 
   const system =
     env.SYSTEM_PROMPT ||
-    "你是一个中文聊天助手。回答要简洁、直接、实用。不要胡编；不确定就说明不确定。";
+    "你是一个中文聊天助手。回答要简洁、直接、实用。不要胡编；不确定就说明不确定。只回答用户这一句，不要替用户续写对话。";
 
-  // Simple single-turn prompt (no memory yet)
-  const prompt = `${system}\n\n用户：${userText}\n助手：`;
+  const messages = [
+    { role: "system", content: system },
+    { role: "user", content: userText },
+  ];
 
-  const result = await env.AI.run(model, {
-    prompt,
-    max_tokens: 512,
-  });
+  const models = env.AI_MODEL ? [env.AI_MODEL, ...MODELS] : MODELS;
+  let lastErr = null;
+  for (const model of models) {
+    try {
+      const result = await env.AI.run(model, { messages, max_tokens: 1024 });
+      const text = cleanReply(pickText(result));
+      if (text) return text;
+    } catch (e) {
+      lastErr = e;
+      console.log("AI model failed:", model, e?.message || e);
+    }
+  }
+  if (lastErr) throw lastErr;
+  return "";
+}
 
-  // Workers AI commonly returns { response: "..." }
-  const text = (result && result.response) ? String(result.response) : "";
+// 不同模型返回的格式不一样：{ response } 或 OpenAI 风格的 { choices: [{ message: { content } }] }
+function pickText(result) {
+  if (!result) return "";
+  if (typeof result === "string") return result;
+  if (typeof result.response === "string") return result.response;
+  const c = result.choices && result.choices[0];
+  if (c && c.message && typeof c.message.content === "string") return c.message.content;
+  return "";
+}
 
-  return text.trim();
+// Qwen3 会先输出 <think>…</think> 思考过程，只留答案；万一还是续写了「用户：」就截掉
+function cleanReply(text) {
+  let t = String(text || "").replace(/<think>[\s\S]*?<\/think>/g, "").replace(/^[\s\S]*<\/think>/, "");
+  const cut = t.search(/\n\s*(用户|User)\s*[:：]/);
+  if (cut > 0) t = t.slice(0, cut);
+  return t.trim();
 }
