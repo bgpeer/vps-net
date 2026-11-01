@@ -1,0 +1,50 @@
+# 青帝机器人（Cloudflare Worker：qingtibot）自动部署
+# Cloudflare 后台连 GitHub（Workers Builds）在手机上一直跳回 GitHub 设置页、连不上，改走 GitHub Actions：
+# main 上改了 worker.js / wrangler.toml 就部署；也可以在 Actions 页手动点 Run workflow。
+#
+# 只需要在本仓库 Settings → Secrets and variables → Actions 里填两个：
+#   CLOUDFLARE_API_TOKEN   Cloudflare「编辑 Cloudflare Workers」模板建的令牌（只能部署 Worker）
+#   CLOUDFLARE_ACCOUNT_ID  Cloudflare 账户 ID
+# 机器人自己的 TELEGRAM_BOT_TOKEN 照旧只放在 Cloudflare（Worker 的机密），部署不会动它；
+# wrangler.toml 里 keep_vars = true，后台填的 SYSTEM_PROMPT / AI_MODEL 也不会被清掉。
+name: Deploy qingtibot worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker.js"
+      - "wrangler.toml"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check secrets
+        env:
+          T: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          A: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$T" ] || [ -z "$A" ]; then
+            echo "::error::还没在仓库 Secrets 里填 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID"
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@3 deploy
