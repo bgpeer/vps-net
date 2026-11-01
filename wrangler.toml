@@ -1,6 +1,10 @@
 name = "vps-net-optimize-bot"
 main = "worker.js"
 compatibility_date = "2026-02-15"
+# Cloudflare 连了这个仓库（Workers Builds）后，main 上一改 worker.js / wrangler.toml 就自动部署。
+# keep_vars：自动部署时保留在 Cloudflare 后台填的变量（SYSTEM_PROMPT / AI_MODEL 等），不被这份文件清掉；
+# 机密（TELEGRAM_BOT_TOKEN）本来就不受影响。机密只填在 Cloudflare，不进仓库。
+keep_vars = true
 
 [ai]
 binding = "AI"
