@@ -17,6 +17,7 @@
 //   3. 管理员命令（回复某人的消息再发）：/warn 警告 · /unwarn 清警告 · /ban 踢出 · /mute [10m|2h|1d] 禁言 ·
 //      /unmute 解禁 · /del 删消息
 // 群里要让它看得到所有消息、能删能禁：把青帝设成群管理员（勾「删除消息」「封禁用户」）。
+// 删不掉消息（没给「删除消息」权限）会在群里提醒一行（一小时最多一次）；编辑过的消息也查广告；相册整组删。
 
 export default {
   async fetch(request, env, ctx) {
@@ -29,11 +30,15 @@ export default {
     if (!update) return new Response("Bad Request", { status: 400 });
 
     try {
-      const msg = update.message;                 // 群里不处理「编辑过的消息」，免得改一个字又触发一次
+      const msg = update.message;
+      const isGroup = (m) => m && m.chat && (m.chat.type === "group" || m.chat.type === "supergroup");
       if (msg && msg.chat) {
         if (msg.chat.type === "private") await onPrivate(env, msg);
-        else if (msg.chat.type === "group" || msg.chat.type === "supergroup") await onGroup(env, ctx, msg);
+        else if (isGroup(msg)) await onGroup(env, ctx, msg);
       }
+      // 群里编辑过的消息：只查广告（先发一句正常话、再改成广告是常见套路），不重新回答、不跑命令
+      const ed = update.edited_message;
+      if (isGroup(ed)) await onGroupEdited(env, ctx, ed);
     } catch (e) {
       console.log("handle failed:", e?.message || e);
     }
@@ -103,8 +108,45 @@ async function onGroup(env, ctx, msg) {
     return reply(env, msg, await aiAnswer(env, q));
   }
 
-  // ---- 广告检查：管理员、机器人、群自己的频道不查 ----
+  return spamCheck(env, ctx, msg, text, admin);
+}
+
+async function onGroupEdited(env, ctx, msg) {
+  const chatId = msg.chat.id;
+  const userId = msg.from && msg.from.id;
+  const asGroup = msg.sender_chat && (msg.sender_chat.id === chatId || msg.is_automatic_forward);
+  const admin = asGroup || (userId && await isAdmin(env, chatId, userId));
+  return spamCheck(env, ctx, msg, (msg.text || msg.caption || "").trim(), admin);
+}
+
+// 相册（几张图一起发）在 Telegram 里是好几条消息，文字只挂在其中一条上：那条判成广告，同一相册后面到的也一起删
+const BAD_ALBUM = new Map();
+
+// 删消息并核对结果。删不掉（11/01 真群里：人踢了、广告还挂着）多半是青帝没有「删除消息」权限 ——
+// 群里提醒一行，同一个群一小时最多提醒一次
+const DEL_WARNED = new Map();
+async function delMsg(env, chatId, messageId) {
+  const r = await tg(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
+  if (r && r.ok) return true;
+  const last = DEL_WARNED.get(chatId) || 0;
+  if (Date.now() - last > 3600 * 1000) {
+    DEL_WARNED.set(chatId, Date.now());
+    await send(env, chatId, `⚠️ 删不了消息（${(r && r.description) || "未知原因"}）：群设置 → 管理员 → 青帝，打开「删除消息」`);
+  }
+  return false;
+}
+
+// ---- 广告检查：管理员、机器人、群自己的频道不查 ----
+async function spamCheck(env, ctx, msg, text, admin) {
+  const chatId = msg.chat.id;
+  const userId = msg.from && msg.from.id;
   if (admin || !userId || (msg.from && msg.from.is_bot)) return;
+
+  const album = msg.media_group_id;
+  const now = Date.now();
+  for (const [k, t] of BAD_ALBUM) if (t < now) BAD_ALBUM.delete(k);
+  if (album && BAD_ALBUM.has(album)) return delMsg(env, chatId, msg.message_id);
+
   if (!worthChecking(msg, text)) return;
   const verdict = await spamVerdict(env, text);
   if (verdict === "OK") {
@@ -112,7 +154,8 @@ async function onGroup(env, ctx, msg) {
     return;
   }
 
-  await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
+  if (album) BAD_ALBUM.set(album, now + 120 * 1000);
+  await delMsg(env, chatId, msg.message_id);
   if (verdict === "SURE" && !(await isKnown(env, chatId, userId))) {
     await tg(env, "banChatMember", { chat_id: chatId, user_id: userId, revoke_messages: true });
     await setWarns(env, chatId, userId, 0);
