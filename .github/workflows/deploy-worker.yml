@@ -43,6 +43,32 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # 记警告次数的 KV：没有就建一个（名字 qingtibot-warn），id 只在这次部署里临时写进 wrangler.toml，不进仓库。
+      # 失败（比如令牌没 KV 权限）不拦部署：机器人照样跑，警告次数退回内存记。
+      - name: KV for warnings
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          find_id() {
+            npx --yes wrangler@4 kv namespace list 2>/dev/null | node -e '
+              let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
+                try { const n = JSON.parse(s.slice(s.indexOf("["))).find(x => /qingtibot-warn$/.test(x.title)); process.stdout.write(n ? n.id : ""); }
+                catch (e) { }
+              });'
+          }
+          id=$(find_id)
+          if [ -z "$id" ]; then
+            npx --yes wrangler@4 kv namespace create qingtibot-warn >/dev/null 2>&1 || true
+            id=$(find_id)
+          fi
+          if [ -z "$id" ]; then
+            echo "::warning::KV 建不了（令牌可能没有 Workers KV 权限），警告次数先记在内存里"
+            exit 0
+          fi
+          echo "::add-mask::$id"
+          printf '\n[[kv_namespaces]]\nbinding = "WARN"\nid = "%s"\n' "$id" >> wrangler.toml
+          echo "KV 已绑上：WARN"
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

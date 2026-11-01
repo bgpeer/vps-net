@@ -1,14 +1,17 @@
 // worker.js —— 青帝：Telegram 机器人（Cloudflare Workers + Workers AI 免费额度）
 //
 // 机密（只放在 Cloudflare，不进仓库）：TELEGRAM_BOT_TOKEN
-// 可选变量：SYSTEM_PROMPT（人设）、AI_MODEL（聊天模型）、SPAM_MODEL（判广告的模型）
+// 可选变量：SYSTEM_PROMPT（人设）、AI_MODEL（聊天模型）、SPAM_MODEL（判广告的模型）、WARN_LIMIT（几次警告封，默认 3）
+// 绑定：AI（Workers AI）、WARN（KV，记警告次数；GitHub Actions 部署时自动建好绑上，id 不进仓库）
 //
 // 私聊：每条都用 AI 回答。
 // 群里（仓库主人 11/01：「放到群里面当管理」，要这三样）：
 //   1. 只在 @青帝、回复青帝的消息、或发 /ask 时才用 AI 回答，平时不插话、不浪费额度
-//   2. 非管理员的消息（带链接 / @ / 转发，或者比较长的）让 AI 判是不是广告诈骗：是 → 删掉 + 禁言，
-//      群里留一行提示、30 秒后自己删掉；判错了管理员回复那人的消息发 /unmute 解开
-//   3. 管理员命令（回复某人的消息再发）：/ban 踢出 · /mute [10m|2h|1d] 禁言 · /unmute 解禁 · /del 删消息
+//   2. 非管理员的消息（带链接 / @ / 转发，或者比较长的）让 AI 判是不是广告诈骗：是 → 删掉 + 警告一次，
+//      满 3 次踢出（仓库主人：「不应该是给予警告，3次吗，然后再封」）。警告 30 天不再犯自动清零。
+//      警告提示 60 秒后自己删掉；判错了管理员回复那人的消息发 /unwarn 清掉
+//   3. 管理员命令（回复某人的消息再发）：/warn 警告 · /unwarn 清警告 · /ban 踢出 · /mute [10m|2h|1d] 禁言 ·
+//      /unmute 解禁 · /del 删消息
 // 群里要让它看得到所有消息、能删能禁：把青帝设成群管理员（勾「删除消息」「封禁用户」）。
 
 export default {
@@ -48,8 +51,8 @@ async function onPrivate(env, msg) {
       "",
       "拉进群并设成管理员后：",
       "· @我、回复我、或 /ask 问题 —— 我才回答",
-      "· 自动删广告诈骗并禁言",
-      "· 管理员回复某人发 /ban /mute /unmute /del",
+      "· 自动删广告诈骗，警告 3 次踢出",
+      "· 管理员回复某人发 /warn /unwarn /ban /mute /unmute /del",
     ].join("\n"));
   }
   if (cmd === "/ping") return send(env, msg.chat.id, "pong ✅ 我在线");
@@ -102,17 +105,50 @@ async function onGroup(env, ctx, msg) {
   if (!(await isSpam(env, text))) return;
 
   await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
-  await tg(env, "restrictChatMember", { chat_id: chatId, user_id: userId, permissions: NO_PERMS });
-  const note = await tg(env, "sendMessage", {
-    chat_id: chatId,
-    text: `🚫 已删除 ${nameOf(msg.from)} 的疑似广告并禁言（误判请管理员回复 TA 发 /unmute）`,
-  });
-  // 提示 30 秒后自己删掉，群里不留一堆
-  const nid = note && note.result && note.result.message_id;
-  if (nid) ctx.waitUntil(sleep(30000).then(() => tg(env, "deleteMessage", { chat_id: chatId, message_id: nid })));
+  const note = await warn(env, chatId, msg.from, "疑似广告已删除");
+  // 警告提示 60 秒后自己删掉，群里不留一堆（踢人的那条留着）
+  const nid = note && !note.banned && note.result && note.result.message_id;
+  if (nid) ctx.waitUntil(sleep(60000).then(() => tg(env, "deleteMessage", { chat_id: chatId, message_id: nid })));
 }
 
-const ADMIN_CMDS = new Set(["/ban", "/mute", "/unmute", "/del"]);
+// ==================== 警告：满 WARN_LIMIT 次踢出 ====================
+// 次数记在 KV（env.WARN），30 天没再犯自动过期清零。没绑 KV 时退回内存（Worker 实例换了会丢，只是兜底）。
+
+const WARN_TTL = 30 * 86400;
+const MEM_WARN = new Map();
+const warnLimit = (env) => Math.max(1, parseInt(env.WARN_LIMIT || "3", 10) || 3);
+const warnKey = (chatId, userId) => `w:${chatId}:${userId}`;
+
+async function getWarns(env, chatId, userId) {
+  const k = warnKey(chatId, userId);
+  if (env.WARN) return parseInt((await env.WARN.get(k)) || "0", 10) || 0;
+  return MEM_WARN.get(k) || 0;
+}
+
+async function setWarns(env, chatId, userId, n) {
+  const k = warnKey(chatId, userId);
+  if (env.WARN) {
+    if (n > 0) await env.WARN.put(k, String(n), { expirationTtl: WARN_TTL });
+    else await env.WARN.delete(k);
+  } else if (n > 0) MEM_WARN.set(k, n);
+  else MEM_WARN.delete(k);
+}
+
+// 警告一次；到上限就踢出并清零。返回发出的那条提示（banned=true 表示这次踢了）
+async function warn(env, chatId, user, why) {
+  const limit = warnLimit(env);
+  const n = (await getWarns(env, chatId, user.id)) + 1;
+  if (n >= limit) {
+    await tg(env, "banChatMember", { chat_id: chatId, user_id: user.id, revoke_messages: true });
+    await setWarns(env, chatId, user.id, 0);
+    const r = await send(env, chatId, `⛔ ${nameOf(user)} 警告满 ${limit} 次，已踢出`);
+    return { ...(r || {}), banned: true };
+  }
+  await setWarns(env, chatId, user.id, n);
+  return send(env, chatId, `⚠️ ${nameOf(user)}：${why}，警告 ${n}/${limit}（满 ${limit} 次踢出）`);
+}
+
+const ADMIN_CMDS = new Set(["/warn", "/unwarn", "/ban", "/mute", "/unmute", "/del"]);
 
 async function adminCommand(env, msg, cmd, text) {
   const chatId = msg.chat.id;
@@ -128,6 +164,14 @@ async function adminCommand(env, msg, cmd, text) {
   if (!who || who.is_bot && who.id === (await getMe(env)).id) return;
   if (await isAdmin(env, chatId, who.id)) return send(env, chatId, "管理员不能处理。");
 
+  if (cmd === "/warn") {
+    await tg(env, "deleteMessage", { chat_id: chatId, message_id: target.message_id });
+    return warn(env, chatId, who, "管理员警告");
+  }
+  if (cmd === "/unwarn") {
+    await setWarns(env, chatId, who.id, 0);
+    return send(env, chatId, `✅ 已清掉 ${nameOf(who)} 的警告`);
+  }
   if (cmd === "/ban") {
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: target.message_id });
     await tg(env, "banChatMember", { chat_id: chatId, user_id: who.id, revoke_messages: true });
