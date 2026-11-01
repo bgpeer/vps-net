@@ -136,6 +136,21 @@ async function delMsg(env, chatId, messageId) {
   return false;
 }
 
+// 踢人：revoke_messages 让 Telegram 顺手删掉这人已有的消息；再记 1 小时「刚踢过」，之后才到的消息直接删
+const MEM_BANNED = new Map();
+const bannedKey = (chatId, userId) => `b:${chatId}:${userId}`;
+async function banUser(env, chatId, userId) {
+  const r = await tg(env, "banChatMember", { chat_id: chatId, user_id: userId, revoke_messages: true });
+  MEM_BANNED.set(bannedKey(chatId, userId), Date.now() + 3600 * 1000);
+  if (env.WARN) await env.WARN.put(bannedKey(chatId, userId), "1", { expirationTtl: 3600 });
+  return r;
+}
+async function recentlyBanned(env, chatId, userId) {
+  const k = bannedKey(chatId, userId);
+  if ((MEM_BANNED.get(k) || 0) > Date.now()) return true;
+  return env.WARN ? (await env.WARN.get(k)) !== null : false;
+}
+
 // ---- 广告检查：管理员、机器人、群自己的频道不查 ----
 async function spamCheck(env, ctx, msg, text, admin) {
   const chatId = msg.chat.id;
@@ -146,9 +161,12 @@ async function spamCheck(env, ctx, msg, text, admin) {
   const now = Date.now();
   for (const [k, t] of BAD_ALBUM) if (t < now) BAD_ALBUM.delete(k);
   if (album && BAD_ALBUM.has(album)) return delMsg(env, chatId, msg.message_id);
+  // 刚被踢的人后面还到的消息（长广告被 Telegram 拆成好几条、同时发的几条，踢之前已经发出去了）：不用再判，直接删
+  if (await recentlyBanned(env, chatId, userId)) return delMsg(env, chatId, msg.message_id);
 
   if (!worthChecking(msg, text)) return;
   const verdict = await spamVerdict(env, text);
+  if (verdict === "ERR") return;                 // AI 判不了：这次放过，但不记「正常说过话」
   if (verdict === "OK") {
     await markKnown(env, chatId, userId);
     return;
@@ -157,7 +175,7 @@ async function spamCheck(env, ctx, msg, text, admin) {
   if (album) BAD_ALBUM.set(album, now + 120 * 1000);
   await delMsg(env, chatId, msg.message_id);
   if (verdict === "SURE" && !(await isKnown(env, chatId, userId))) {
-    await tg(env, "banChatMember", { chat_id: chatId, user_id: userId, revoke_messages: true });
+    await banUser(env, chatId, userId);
     await setWarns(env, chatId, userId, 0);
     return send(env, chatId, `⛔ 已踢出 ${nameOf(msg.from)}（明显广告）`);
   }
@@ -195,7 +213,7 @@ async function warn(env, chatId, user, why) {
   const limit = warnLimit(env);
   const n = (await getWarns(env, chatId, user.id)) + 1;
   if (n >= limit) {
-    await tg(env, "banChatMember", { chat_id: chatId, user_id: user.id, revoke_messages: true });
+    await banUser(env, chatId, user.id);
     await setWarns(env, chatId, user.id, 0);
     const r = await send(env, chatId, `⛔ ${nameOf(user)} 警告满 ${limit} 次，已踢出`);
     return { ...(r || {}), banned: true };
@@ -248,7 +266,7 @@ async function adminCommand(env, msg, cmd, text) {
   }
   if (cmd === "/ban") {
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: target.message_id });
-    await tg(env, "banChatMember", { chat_id: chatId, user_id: who.id, revoke_messages: true });
+    await banUser(env, chatId, who.id);
     return send(env, chatId, `⛔ 已踢出 ${nameOf(who)}`);
   }
   if (cmd === "/mute") {
@@ -400,13 +418,22 @@ async function callWorkersAI(env, userText) {
 
 // 判广告：分 SURE（确定）/ MAYBE（拿不准）/ OK 三档。要分「确定」就不能用太小的模型（8B 分不清程度），
 // 默认 Llama 3.3 70B：只回一个词，输入几百字，免费额度一天够判上千条。SPAM_MODEL 可覆盖。
-// 判不出来（出错 / 回的不是这三个词）一律当 OK，宁可漏不错杀。
+// 回的不是这三个词当 OK，宁可漏不错杀；大模型出错（限流 / 不可用）退 8B 再判一次，还不行返回 ERR（这次放过）。
 const SPAM_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const SPAM_FALLBACK = "@cf/meta/llama-3.1-8b-instruct-fast";
 
 async function spamVerdict(env, text) {
-  if (!env.AI) return "OK";
+  if (!env.AI) return "ERR";
+  for (const model of [env.SPAM_MODEL || SPAM_MODEL, SPAM_FALLBACK]) {
+    const v = await spamVerdictWith(env, model, text);
+    if (v !== "ERR") return v;
+  }
+  return "ERR";
+}
+
+async function spamVerdictWith(env, model, text) {
   try {
-    const r = await env.AI.run(env.SPAM_MODEL || SPAM_MODEL, {
+    const r = await env.AI.run(model, {
       messages: [
         {
           role: "system",
@@ -428,8 +455,8 @@ async function spamVerdict(env, text) {
     if (/\bMAYBE\b/.test(v)) return "MAYBE";
     return "OK";
   } catch (e) {
-    console.log("spam check failed:", e?.message || e);
-    return "OK";
+    console.log("spam check failed:", model, e?.message || e);
+    return "ERR";
   }
 }
 
