@@ -7,8 +7,12 @@
 // 私聊：每条都用 AI 回答。
 // 群里（仓库主人 11/01：「放到群里面当管理」，要这三样）：
 //   1. 只在 @青帝、回复青帝的消息、或发 /ask 时才用 AI 回答，平时不插话、不浪费额度
-//   2. 非管理员的消息（带链接 / @ / 转发，或者比较长的）让 AI 判是不是广告诈骗：是 → 删掉 + 警告一次，
-//      满 3 次踢出（仓库主人：「不应该是给予警告，3次吗，然后再封」）。警告 30 天不再犯自动清零。
+//   2. 非管理员的消息（带链接 / @ / 转发，或者比较长的）让 AI 判是不是广告诈骗，分三档
+//      （仓库主人：「可以确定的直接踢，拿不准的才警告吗」）：
+//        · 确定是广告 + 这人在群里还没正常说过话（典型广告号：进群第一句就是广告）→ 删掉、直接踢
+//        · 确定是广告但这人以前正常聊过（可能号被盗、或者在真心推荐）/ 拿不准 → 删掉 + 警告一次
+//        · 不是 → 不动，记下「这人正常说过话」
+//      警告满 3 次踢出（「不应该是给予警告，3次吗，然后再封」）；30 天不再犯自动清零。
 //      警告提示 60 秒后自己删掉；判错了管理员回复那人的消息发 /unwarn 清掉
 //   3. 管理员命令（回复某人的消息再发）：/warn 警告 · /unwarn 清警告 · /ban 踢出 · /mute [10m|2h|1d] 禁言 ·
 //      /unmute 解禁 · /del 删消息
@@ -102,10 +106,19 @@ async function onGroup(env, ctx, msg) {
   // ---- 广告检查：管理员、机器人、群自己的频道不查 ----
   if (admin || !userId || (msg.from && msg.from.is_bot)) return;
   if (!worthChecking(msg, text)) return;
-  if (!(await isSpam(env, text))) return;
+  const verdict = await spamVerdict(env, text);
+  if (verdict === "OK") {
+    await markKnown(env, chatId, userId);
+    return;
+  }
 
   await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
-  const note = await warn(env, chatId, msg.from, "疑似广告已删除");
+  if (verdict === "SURE" && !(await isKnown(env, chatId, userId))) {
+    await tg(env, "banChatMember", { chat_id: chatId, user_id: userId, revoke_messages: true });
+    await setWarns(env, chatId, userId, 0);
+    return send(env, chatId, `⛔ 已踢出 ${nameOf(msg.from)}（明显广告）`);
+  }
+  const note = await warn(env, chatId, msg.from, verdict === "SURE" ? "广告已删除" : "疑似广告已删除");
   // 警告提示 60 秒后自己删掉，群里不留一堆（踢人的那条留着）
   const nid = note && !note.banned && note.result && note.result.message_id;
   if (nid) ctx.waitUntil(sleep(60000).then(() => tg(env, "deleteMessage", { chat_id: chatId, message_id: nid })));
@@ -146,6 +159,24 @@ async function warn(env, chatId, user, why) {
   }
   await setWarns(env, chatId, user.id, n);
   return send(env, chatId, `⚠️ ${nameOf(user)}：${why}，警告 ${n}/${limit}（满 ${limit} 次踢出）`);
+}
+
+// 「这人在群里正常说过话」：AI 判过 OK 的消息记一次（每人只写一次 KV），90 天不说话过期
+const KNOWN_TTL = 90 * 86400;
+const MEM_KNOWN = new Set();
+const knownKey = (chatId, userId) => `k:${chatId}:${userId}`;
+
+async function isKnown(env, chatId, userId) {
+  const k = knownKey(chatId, userId);
+  if (env.WARN) return (await env.WARN.get(k)) !== null;
+  return MEM_KNOWN.has(k);
+}
+
+async function markKnown(env, chatId, userId) {
+  const k = knownKey(chatId, userId);
+  if (env.WARN) {
+    if ((await env.WARN.get(k)) === null) await env.WARN.put(k, "1", { expirationTtl: KNOWN_TTL });
+  } else MEM_KNOWN.add(k);
 }
 
 const ADMIN_CMDS = new Set(["/warn", "/unwarn", "/ban", "/mute", "/unmute", "/del"]);
@@ -324,29 +355,38 @@ async function callWorkersAI(env, userText) {
   return "";
 }
 
-// 判广告用便宜的小模型：只要它回一个词，每条只花一点点额度。判不出来（出错）一律当不是广告，宁可漏不错杀。
-const SPAM_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+// 判广告：分 SURE（确定）/ MAYBE（拿不准）/ OK 三档。要分「确定」就不能用太小的模型（8B 分不清程度），
+// 默认 Llama 3.3 70B：只回一个词，输入几百字，免费额度一天够判上千条。SPAM_MODEL 可覆盖。
+// 判不出来（出错 / 回的不是这三个词）一律当 OK，宁可漏不错杀。
+const SPAM_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
-async function isSpam(env, text) {
-  if (!env.AI) return false;
+async function spamVerdict(env, text) {
+  if (!env.AI) return "OK";
   try {
     const r = await env.AI.run(env.SPAM_MODEL || SPAM_MODEL, {
       messages: [
         {
           role: "system",
-          content:
-            "你是 Telegram 群的反垃圾审核。判断用户这条消息是不是广告、引流、诈骗、色情、赌博、刷单、" +
-            "卖号卖卡、拉人进别的群或频道、加微信 / QQ / 私聊领福利。正常聊天、提问、讨论技术、分享经验都不算。" +
-            "只回答一个词：SPAM 或 OK。",
+          content: [
+            "你是 Telegram 技术交流群的反垃圾审核。判断用户这条消息，只回答一个词：SURE、MAYBE 或 OK。",
+            "SURE = 明显的广告诈骗，不会是正常群友说的话：留微信 / QQ / TG 号或链接拉人私聊、",
+            "推广别的群或频道、博彩、色情、刷单兼职、卖号卖卡、代充、高收益投资、「私聊领福利」这类。",
+            "MAYBE = 有推广嫌疑，但也可能是群友正常分享：比如推荐某个机场 / 软件 / 服务并附了链接或邀请码。",
+            "OK = 正常聊天、提问、讨论技术、分享经验、发教程或项目链接。",
+            "拿不准是 SURE 还是 MAYBE 时回 MAYBE；拿不准是 MAYBE 还是 OK 时回 OK。",
+          ].join("\n"),
         },
         { role: "user", content: text.slice(0, 1500) },
       ],
       max_tokens: 5,
     });
-    return /\bSPAM\b/i.test(cleanReply(pickText(r)));
+    const v = cleanReply(pickText(r)).toUpperCase();
+    if (/\bSURE\b/.test(v)) return "SURE";
+    if (/\bMAYBE\b/.test(v)) return "MAYBE";
+    return "OK";
   } catch (e) {
     console.log("spam check failed:", e?.message || e);
-    return false;
+    return "OK";
   }
 }
 
