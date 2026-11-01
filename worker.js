@@ -77,12 +77,20 @@ async function onGroup(env, ctx, msg) {
   }
 
   // ---- 问答：@我 / 回复我 / /ask ----
-  const mentioned = me.username && text.toLowerCase().includes("@" + me.username.toLowerCase());
+  // @ 的三种样子：@用户名；从成员列表点出来的 @青帝（text_mention，带 id）；手打的「@青帝」纯文字（11/01 真群里就是这样，没回）
+  const ents = [...(msg.entities || []), ...(msg.caption_entities || [])];
+  const byName = me.first_name ? "@" + me.first_name : "";
+  const mentioned =
+    (me.username && text.toLowerCase().includes("@" + me.username.toLowerCase())) ||
+    ents.some((e) => e.type === "text_mention" && e.user && e.user.id === me.id) ||
+    (byName && text.includes(byName));
   const repliedToMe = msg.reply_to_message && msg.reply_to_message.from && msg.reply_to_message.from.id === me.id;
   if (cmd === "/ask" || mentioned || repliedToMe) {
     let q = text;
     if (cmd === "/ask") q = text.replace(/^\/ask(@\w+)?/i, "");
     if (me.username) q = q.replace(new RegExp("@" + me.username, "ig"), "");
+    if (byName) q = q.split(byName).join("");
+    for (const e of ents) if (e.type === "text_mention" && e.user && e.user.id === me.id) q = q.replace(text.substr(e.offset, e.length), "");
     q = q.trim();
     if (!q) return reply(env, msg, "想问什么？@我 后面直接写问题。");
     return reply(env, msg, await aiAnswer(env, q));
