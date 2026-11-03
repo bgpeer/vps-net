@@ -108,7 +108,12 @@ async function onGroup(env, ctx, msg) {
     return reply(env, msg, await aiAnswer(env, q));
   }
 
-  return spamCheck(env, ctx, msg, text, admin);
+  return spamCheck(env, ctx, msg, msgText(msg), admin);
+}
+
+// 查广告要看的文字：正文 / 图片说明 + 引用别处消息时带的那段引文（「回复到别的聊天」常被拿来塞广告）
+function msgText(msg) {
+  return [msg.text || msg.caption || "", (msg.quote && msg.quote.text) || ""].join("\n").trim();
 }
 
 async function onGroupEdited(env, ctx, msg) {
@@ -116,7 +121,7 @@ async function onGroupEdited(env, ctx, msg) {
   const userId = msg.from && msg.from.id;
   const asGroup = msg.sender_chat && (msg.sender_chat.id === chatId || msg.is_automatic_forward);
   const admin = asGroup || (userId && await isAdmin(env, chatId, userId));
-  return spamCheck(env, ctx, msg, (msg.text || msg.caption || "").trim(), admin);
+  return spamCheck(env, ctx, msg, msgText(msg), admin);
 }
 
 // 相册（几张图一起发）在 Telegram 里是好几条消息，文字只挂在其中一条上：那条判成广告，同一相册后面到的也一起删
@@ -140,7 +145,10 @@ async function delMsg(env, chatId, messageId) {
 const MEM_BANNED = new Map();
 const bannedKey = (chatId, userId) => `b:${chatId}:${userId}`;
 async function banUser(env, chatId, userId) {
-  const r = await tg(env, "banChatMember", { chat_id: chatId, user_id: userId, revoke_messages: true });
+  // 频道身份（id 是负数）用 banChatSenderChat，真人用 banChatMember
+  const r = userId < 0
+    ? await tg(env, "banChatSenderChat", { chat_id: chatId, sender_chat_id: userId })
+    : await tg(env, "banChatMember", { chat_id: chatId, user_id: userId, revoke_messages: true });
   MEM_BANNED.set(bannedKey(chatId, userId), Date.now() + 3600 * 1000);
   if (env.WARN) await env.WARN.put(bannedKey(chatId, userId), "1", { expirationTtl: 3600 });
   return r;
@@ -152,34 +160,60 @@ async function recentlyBanned(env, chatId, userId) {
 }
 
 // ---- 广告检查：管理员、机器人、群自己的频道不查 ----
+// 11/03 真群里：两个号一前一后发同一段广告（后一个是回复前一个），前一个删了踢了，后一个挂着没动。
+// 所以：判成广告的那段文字记 1 小时「指纹」，一模一样的再出现不用等 AI，直接按广告处理（AI 那会儿忙不过来也照样拦）；
+// 以「频道身份」发的（sender_chat 是别的频道）按频道封（banChatSenderChat），不然封的是 Telegram 的公共占位号。
+// 每次判完在 Cloudflare 日志里记一行（不记消息内容），出了问题能查。
+const MEM_SPAMFP = new Map();
+function spamFp(chatId, text) {
+  const t = text.replace(/\s+/g, "").slice(0, 600);
+  let h = 2166136261;
+  for (let i = 0; i < t.length; i++) h = Math.imul(h ^ t.charCodeAt(i), 16777619);
+  return `s:${chatId}:${(h >>> 0).toString(36)}:${t.length}`;
+}
+async function isKnownSpam(env, fp) {
+  if ((MEM_SPAMFP.get(fp) || 0) > Date.now()) return true;
+  return env.WARN ? (await env.WARN.get(fp)) !== null : false;
+}
+async function markSpam(env, fp) {
+  MEM_SPAMFP.set(fp, Date.now() + 3600 * 1000);
+  if (env.WARN) await env.WARN.put(fp, "1", { expirationTtl: 3600 });
+}
+
 async function spamCheck(env, ctx, msg, text, admin) {
   const chatId = msg.chat.id;
-  const userId = msg.from && msg.from.id;
-  if (admin || !userId || (msg.from && msg.from.is_bot)) return;
+  const ch = msg.sender_chat && msg.sender_chat.id !== chatId && !msg.is_automatic_forward ? msg.sender_chat : null;
+  const who = ch ? { id: ch.id, first_name: ch.title || "频道" } : msg.from;   // 用频道身份发的：按频道算
+  const userId = who && who.id;
+  if (admin || !userId || (!ch && msg.from && msg.from.is_bot)) return;
 
   const album = msg.media_group_id;
   const now = Date.now();
   for (const [k, t] of BAD_ALBUM) if (t < now) BAD_ALBUM.delete(k);
+  for (const [k, t] of MEM_SPAMFP) if (t < now) MEM_SPAMFP.delete(k);
   if (album && BAD_ALBUM.has(album)) return delMsg(env, chatId, msg.message_id);
   // 刚被踢的人后面还到的消息（长广告被 Telegram 拆成好几条、同时发的几条，踢之前已经发出去了）：不用再判，直接删
   if (await recentlyBanned(env, chatId, userId)) return delMsg(env, chatId, msg.message_id);
 
   if (!worthChecking(msg, text)) return;
-  const verdict = await spamVerdict(env, text);
+  const fp = spamFp(chatId, text);
+  let verdict = (await isKnownSpam(env, fp)) ? "SURE" : await spamVerdict(env, text);
+  console.log("spam-check", JSON.stringify({ chat: chatId, user: userId, len: text.length, verdict, asChannel: !!ch }));
   if (verdict === "ERR") return;                 // AI 判不了：这次放过，但不记「正常说过话」
   if (verdict === "OK") {
     await markKnown(env, chatId, userId);
     return;
   }
+  if (verdict === "SURE") await markSpam(env, fp);
 
   if (album) BAD_ALBUM.set(album, now + 120 * 1000);
   await delMsg(env, chatId, msg.message_id);
-  if (verdict === "SURE" && !(await isKnown(env, chatId, userId))) {
+  if (verdict === "SURE" && (ch || !(await isKnown(env, chatId, userId)))) {
     await banUser(env, chatId, userId);
     await setWarns(env, chatId, userId, 0);
-    return send(env, chatId, `⛔ 已踢出 ${nameOf(msg.from)}（明显广告）`);
+    return send(env, chatId, `⛔ 已踢出 ${nameOf(who)}（明显广告）`);
   }
-  const note = await warn(env, chatId, msg.from, verdict === "SURE" ? "广告已删除" : "疑似广告已删除");
+  const note = await warn(env, chatId, who, verdict === "SURE" ? "广告已删除" : "疑似广告已删除");
   // 警告提示 60 秒后自己删掉，群里不留一堆（踢人的那条留着）
   const nid = note && !note.banned && note.result && note.result.message_id;
   if (nid) ctx.waitUntil(sleep(60000).then(() => tg(env, "deleteMessage", { chat_id: chatId, message_id: nid })));
