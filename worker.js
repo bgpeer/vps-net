@@ -42,7 +42,13 @@ export default {
     } catch (e) {
       console.log("handle failed:", e?.message || e);
     }
+    ctx.waitUntil(sweepNotices(env));              // 顺手删掉到点的提示
     return ok();                                  // 永远回 200：否则 Telegram 会一直重发同一条
+  },
+
+  // 每分钟一次（wrangler.toml 的 crons）：群里没人说话时，到点的提示也照样删
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(sweepNotices(env));
   },
 };
 
@@ -136,7 +142,7 @@ async function delMsg(env, chatId, messageId) {
   const last = DEL_WARNED.get(chatId) || 0;
   if (Date.now() - last > 3600 * 1000) {
     DEL_WARNED.set(chatId, Date.now());
-    await send(env, chatId, `⚠️ 删不了消息（${(r && r.description) || "未知原因"}）：群设置 → 管理员 → 青帝，打开「删除消息」`);
+    await notice(env, chatId, `⚠️ 删不了消息（${(r && r.description) || "未知原因"}）：群设置 → 管理员 → 青帝，打开「删除消息」`, 600);
   }
   return false;
 }
@@ -211,12 +217,9 @@ async function spamCheck(env, ctx, msg, text, admin) {
   if (verdict === "SURE" && (ch || !(await isKnown(env, chatId, userId)))) {
     await banUser(env, chatId, userId);
     await setWarns(env, chatId, userId, 0);
-    return send(env, chatId, `⛔ 已踢出 ${nameOf(who)}（明显广告）`);
+    return notice(env, chatId, `⛔ 已踢出 ${nameOf(who)}（明显广告）`);
   }
-  const note = await warn(env, chatId, who, verdict === "SURE" ? "广告已删除" : "疑似广告已删除");
-  // 警告提示 60 秒后自己删掉，群里不留一堆（踢人的那条留着）
-  const nid = note && !note.banned && note.result && note.result.message_id;
-  if (nid) ctx.waitUntil(sleep(60000).then(() => tg(env, "deleteMessage", { chat_id: chatId, message_id: nid })));
+  await warn(env, chatId, who, verdict === "SURE" ? "广告已删除" : "疑似广告已删除");
 }
 
 // ==================== 警告：满 WARN_LIMIT 次踢出 ====================
@@ -249,11 +252,11 @@ async function warn(env, chatId, user, why) {
   if (n >= limit) {
     await banUser(env, chatId, user.id);
     await setWarns(env, chatId, user.id, 0);
-    const r = await send(env, chatId, `⛔ ${nameOf(user)} 警告满 ${limit} 次，已踢出`);
+    const r = await notice(env, chatId, `⛔ ${nameOf(user)} 警告满 ${limit} 次，已踢出`);
     return { ...(r || {}), banned: true };
   }
   await setWarns(env, chatId, user.id, n);
-  return send(env, chatId, `⚠️ ${nameOf(user)}：${why}，警告 ${n}/${limit}（满 ${limit} 次踢出）`);
+  return notice(env, chatId, `⚠️ ${nameOf(user)}：${why}，警告 ${n}/${limit}（满 ${limit} 次踢出）`);
 }
 
 // 「这人在群里正常说过话」：AI 判过 OK 的消息记一次（每人只写一次 KV），90 天不说话过期
@@ -281,14 +284,14 @@ async function adminCommand(env, msg, cmd, text) {
   const target = msg.reply_to_message;
   // 命令本身删掉，群里干净
   await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
-  if (!target) return send(env, chatId, `用法：回复要处理的那条消息，再发 ${cmd}`);
+  if (!target) return notice(env, chatId, `用法：回复要处理的那条消息，再发 ${cmd}`);
 
   const who = target.from;
   if (cmd === "/del") {
     return tg(env, "deleteMessage", { chat_id: chatId, message_id: target.message_id });
   }
   if (!who || who.is_bot && who.id === (await getMe(env)).id) return;
-  if (await isAdmin(env, chatId, who.id)) return send(env, chatId, "管理员不能处理。");
+  if (await isAdmin(env, chatId, who.id)) return notice(env, chatId, "管理员不能处理。");
 
   if (cmd === "/warn") {
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: target.message_id });
@@ -296,23 +299,23 @@ async function adminCommand(env, msg, cmd, text) {
   }
   if (cmd === "/unwarn") {
     await setWarns(env, chatId, who.id, 0);
-    return send(env, chatId, `✅ 已清掉 ${nameOf(who)} 的警告`);
+    return notice(env, chatId, `✅ 已清掉 ${nameOf(who)} 的警告`);
   }
   if (cmd === "/ban") {
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: target.message_id });
     await banUser(env, chatId, who.id);
-    return send(env, chatId, `⛔ 已踢出 ${nameOf(who)}`);
+    return notice(env, chatId, `⛔ 已踢出 ${nameOf(who)}`);
   }
   if (cmd === "/mute") {
     const secs = parseDuration(text.split(/\s+/)[1]);
     const body = { chat_id: chatId, user_id: who.id, permissions: NO_PERMS };
     if (secs) body.until_date = Math.floor(Date.now() / 1000) + secs;
     await tg(env, "restrictChatMember", body);
-    return send(env, chatId, `🔇 已禁言 ${nameOf(who)}${secs ? "（" + text.split(/\s+/)[1] + "）" : "（直到解禁）"}`);
+    return notice(env, chatId, `🔇 已禁言 ${nameOf(who)}${secs ? "（" + text.split(/\s+/)[1] + "）" : "（直到解禁）"}`);
   }
   if (cmd === "/unmute") {
     await tg(env, "restrictChatMember", { chat_id: chatId, user_id: who.id, permissions: ALL_PERMS });
-    return send(env, chatId, `🔊 已解除 ${nameOf(who)} 的禁言`);
+    return notice(env, chatId, `🔊 已解除 ${nameOf(who)} 的禁言`);
   }
 }
 
@@ -344,6 +347,49 @@ function nameOf(u) {
   if (!u) return "TA";
   const n = [u.first_name, u.last_name].filter(Boolean).join(" ");
   return n || (u.username ? "@" + u.username : "TA");
+}
+
+// ==================== 群里的提示：过一会儿自己删掉 ====================
+// 仓库主人：「让青帝把这些人踢出的信息删掉之后把自己的信息也删掉」。踢人 / 警告 / 管理员命令的回执都走 notice()，
+// 默认 60 秒后删（「删不了消息」那条留 10 分钟，给管理员看见）。AI 问答的回答不删。
+// 不能靠 waitUntil 里 sleep：Cloudflare 只给响应后 30 秒，以前写的 60 秒其实删不掉。
+// 所以记进 KV 的待删清单（一个键 pending），每次有消息进来和每分钟的 cron 各扫一遍；没绑 KV 就记内存。
+const MEM_PENDING = [];
+
+async function notice(env, chatId, text, secs = 60) {
+  const r = await send(env, chatId, text);
+  const mid = r && r.ok && r.result && r.result.message_id;
+  if (mid) await queueDelete(env, chatId, mid, secs);
+  return r;
+}
+
+async function queueDelete(env, chatId, messageId, secs) {
+  const item = { c: chatId, m: messageId, t: Date.now() + secs * 1000 };
+  if (!env.WARN) { MEM_PENDING.push(item); return; }
+  const list = JSON.parse((await env.WARN.get("pending")) || "[]");
+  list.push(item);
+  await env.WARN.put("pending", JSON.stringify(list.slice(-200)));
+}
+
+async function sweepNotices(env) {
+  try {
+    const now = Date.now();
+    const list = env.WARN ? JSON.parse((await env.WARN.get("pending")) || "[]") : MEM_PENDING.splice(0);
+    if (!list.length) return;
+    const keep = [];
+    for (const it of list) {
+      if (it.t > now) { keep.push(it); continue; }
+      await tg(env, "deleteMessage", { chat_id: it.c, message_id: it.m });   // 删不掉（已被手动删）也算处理过
+    }
+    if (env.WARN) {
+      if (keep.length !== list.length) {
+        if (keep.length) await env.WARN.put("pending", JSON.stringify(keep));
+        else await env.WARN.delete("pending");
+      }
+    } else MEM_PENDING.push(...keep);
+  } catch (e) {
+    console.log("sweep failed:", e?.message || e);
+  }
 }
 
 // ==================== Telegram ====================

@@ -10,5 +10,9 @@ keep_vars = true
 binding = "AI"
 
 # 日志留在 Cloudflare 后台（qingtibot → Observability），只有账户主人看得到；查「删不掉 / 判不了」这类问题用
+# 每分钟扫一次待删的群提示（踢人 / 警告回执 60 秒后自删）
+[triggers]
+crons = ["* * * * *"]
+
 [observability]
 enabled = true
