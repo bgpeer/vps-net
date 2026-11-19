@@ -1,6 +1,6 @@
 // worker.js —— 青帝：Telegram 机器人（Cloudflare Workers + Workers AI 免费额度）
 //
-// 机密（只放在 Cloudflare，不进仓库）：TELEGRAM_BOT_TOKEN
+// 机密（只放在 Cloudflare，不进仓库）：TELEGRAM_BOT_TOKEN、TELEGRAM_WEBHOOK_SECRET（验签用，见下面）
 // 可选变量：SYSTEM_PROMPT（人设）、AI_MODEL（聊天模型）、SPAM_MODEL（判广告的模型）、WARN_LIMIT（几次警告封，默认 3）
 // 绑定：AI（Workers AI）、WARN（KV，记警告次数；GitHub Actions 部署时自动建好绑上，id 不进仓库）
 //
@@ -18,6 +18,14 @@
 //      /unmute 解禁 · /del 删消息
 // 群里要让它看得到所有消息、能删能禁：把青帝设成群管理员（勾「删除消息」「封禁用户」）。
 // 删不掉消息（没给「删除消息」权限）会在群里提醒一行（一小时最多一次）；编辑过的消息也查广告；相册整组删。
+// 私聊总开关在下面 PRIVATE_ENABLED（true 开 / false 关），改完 push 到 main 就自动部署。
+// Webhook 验签：先在 Telegram 重新 setWebhook（带上 secret_token 参数），再去 Cloudflare 填
+// TELEGRAM_WEBHOOK_SECRET（同一个值）；这个顺序不会断消息。没设机密时不拦截，照常工作。
+
+// ==================== 总开关 ====================
+// 私聊总开关：true = 私聊正常用 AI 回答；false = 私聊不调用 AI，只回一句「私聊已关闭」。
+// 想关私聊就把这里改成 false，push 到 main 自动部署。群不受影响。
+const PRIVATE_ENABLED = true;
 
 export default {
   async fetch(request, env, ctx) {
@@ -25,6 +33,7 @@ export default {
     if (url.pathname === "/") return ok();
     if (url.pathname !== "/telegram") return new Response("Not Found", { status: 404 });
     if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+    if (!verifyWebhook(request, env)) return new Response("Forbidden", { status: 403 });
 
     const update = await request.json().catch(() => null);
     if (!update) return new Response("Bad Request", { status: 400 });
@@ -54,11 +63,31 @@ export default {
 
 const ok = () => new Response("ok", { status: 200 });
 
+// Webhook 验签：setWebhook 时配了 secret_token，Telegram 每次都会在
+// X-Telegram-Bot-Api-Secret-Token 请求头里带上。没配 TELEGRAM_WEBHOOK_SECRET
+// 时保持原样（不拦截）；配了就严格校验，对不上直接 403，不解析、不执行。
+// 密钥只放在 Cloudflare（Worker 机密），不进仓库。
+function verifyWebhook(request, env) {
+  const secret = env.TELEGRAM_WEBHOOK_SECRET;
+  if (!secret) return true;
+  const got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+  return safeEqual(got, secret);
+}
+
+// 别用 === 逐字比：先比长度，再按位异或累加，耗时不随第几位不同而变。
+function safeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 // ==================== 私聊 ====================
 
 async function onPrivate(env, msg) {
   const text = (msg.text || "").trim();
   if (!text) return;
+  if (!PRIVATE_ENABLED) return send(env, msg.chat.id, "私聊已关闭。");
   const cmd = parseCmd(text);
   if (cmd === "/start" || cmd === "/help") {
     return send(env, msg.chat.id, [
